@@ -1,0 +1,107 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "Panel": "North",
+        "Comment": "Higher pressure panel"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              424500,
+              3364566
+            ],
+            [
+              437500,
+              3364566
+            ],
+            [
+              437500,
+              3367100
+            ],
+            [
+              424500,
+              3367100
+            ],
+            [
+              424500,
+              3364566
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "Panel": "Central",
+        "Comment": "Intermediate pressure panel"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              424500,
+              3362033
+            ],
+            [
+              437500,
+              3362033
+            ],
+            [
+              437500,
+              3364566
+            ],
+            [
+              424500,
+              3364566
+            ],
+            [
+              424500,
+              3362033
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "Panel": "South",
+        "Comment": "Lower pressure panel"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [
+              424500,
+              3359500
+            ],
+            [
+              437500,
+              3359500
+            ],
+            [
+              437500,
+              3362033
+            ],
+            [
+              424500,
+              3362033
+            ],
+            [
+              424500,
+              3359500
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

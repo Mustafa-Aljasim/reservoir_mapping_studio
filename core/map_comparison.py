@@ -1,0 +1,170 @@
+"""Saved-map comparison, grid alignment, and delta calculations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+
+import numpy as np
+from scipy.interpolate import griddata
+
+from core.crs import crs_are_compatible
+
+
+@dataclass(frozen=True)
+class CompatibilityReport:
+    side_by_side_allowed: bool
+    delta_allowed: bool
+    issues: list[str]
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class DeltaResult:
+    grid_x: np.ndarray
+    grid_y: np.ndarray
+    grid_z: np.ndarray
+    metadata: dict[str, object]
+
+
+def grids_are_identical(first: dict[str, object], second: dict[str, object], tolerance: float = 1e-9) -> bool:
+    return (
+        np.asarray(first["grid_x"]).shape == np.asarray(second["grid_x"]).shape
+        and np.asarray(first["grid_y"]).shape == np.asarray(second["grid_y"]).shape
+        and np.allclose(np.asarray(first["grid_x"], dtype=float), np.asarray(second["grid_x"], dtype=float), atol=tolerance, rtol=0)
+        and np.allclose(np.asarray(first["grid_y"], dtype=float), np.asarray(second["grid_y"], dtype=float), atol=tolerance, rtol=0)
+    )
+
+
+def grid_spacing(scenario: dict[str, object]) -> tuple[float | None, float | None]:
+    grid_x = np.asarray(scenario["grid_x"], dtype=float)
+    grid_y = np.asarray(scenario["grid_y"], dtype=float)
+    dx = float(np.nanmedian(np.diff(grid_x[0, :]))) if grid_x.shape[1] > 1 else None
+    dy = float(np.nanmedian(np.diff(grid_y[:, 0]))) if grid_y.shape[0] > 1 else None
+    return dx, dy
+
+
+def grid_extent(scenario: dict[str, object]) -> tuple[float, float, float, float]:
+    grid_x = np.asarray(scenario["grid_x"], dtype=float)
+    grid_y = np.asarray(scenario["grid_y"], dtype=float)
+    return float(np.nanmin(grid_x)), float(np.nanmax(grid_x)), float(np.nanmin(grid_y)), float(np.nanmax(grid_y))
+
+
+def compatibility_report(first: dict[str, object], second: dict[str, object]) -> CompatibilityReport:
+    issues: list[str] = []
+    warnings: list[str] = []
+    if first.get("coordinate_unit") != second.get("coordinate_unit"):
+        issues.append("Coordinate units differ.")
+    if not crs_are_compatible(first.get("crs"), second.get("crs")):
+        issues.append("Coordinate reference systems differ.")
+    if first.get("property") != second.get("property"):
+        issues.append("Properties differ.")
+    if (first.get("property_unit") or "") != (second.get("property_unit") or ""):
+        issues.append("Property units differ.")
+    if not grids_are_identical(first, second):
+        warnings.append("Grid alignment required before arithmetic.")
+    if first.get("geometry_context") != second.get("geometry_context"):
+        warnings.append("Geometry context differs; review before interpreting the comparison.")
+    return CompatibilityReport(
+        side_by_side_allowed=True,
+        delta_allowed=not issues,
+        issues=issues,
+        warnings=warnings,
+    )
+
+
+def resample_to_grid(source: dict[str, object], target_grid_x: np.ndarray, target_grid_y: np.ndarray) -> np.ndarray:
+    source_x = np.asarray(source["grid_x"], dtype=float)
+    source_y = np.asarray(source["grid_y"], dtype=float)
+    source_z = np.asarray(source["grid_z"], dtype=float)
+    finite = np.isfinite(source_x) & np.isfinite(source_y) & np.isfinite(source_z)
+    if finite.sum() < 3:
+        raise ValueError("Source map has too few finite grid cells for alignment.")
+    aligned = griddata(
+        np.column_stack([source_x[finite], source_y[finite]]),
+        source_z[finite],
+        (target_grid_x, target_grid_y),
+        method="linear",
+    )
+    missing = ~np.isfinite(aligned)
+    if missing.any():
+        nearest = griddata(
+            np.column_stack([source_x[finite], source_y[finite]]),
+            source_z[finite],
+            (target_grid_x, target_grid_y),
+            method="nearest",
+        )
+        aligned[missing] = nearest[missing]
+    return np.asarray(aligned, dtype=float)
+
+
+def calculate_delta(
+    map_a: dict[str, object],
+    map_b: dict[str, object],
+    operation: str = "Map B - Map A",
+) -> DeltaResult:
+    report = compatibility_report(map_a, map_b)
+    if not report.delta_allowed:
+        raise ValueError("Delta map cannot be calculated: " + "; ".join(report.issues))
+    grid_x = np.asarray(map_a["grid_x"], dtype=float)
+    grid_y = np.asarray(map_a["grid_y"], dtype=float)
+    a_z = np.asarray(map_a["grid_z"], dtype=float)
+    if grids_are_identical(map_a, map_b):
+        b_z = np.asarray(map_b["grid_z"], dtype=float)
+        alignment = "Direct subtraction on identical grids"
+    else:
+        b_z = resample_to_grid(map_b, grid_x, grid_y)
+        alignment = "Map B resampled to Map A grid"
+    delta = b_z - a_z
+    metadata = {
+        "Source_Map_A": map_a.get("name"),
+        "Source_Map_B": map_b.get("name"),
+        "Operation": operation,
+        "Property": map_a.get("property"),
+        "Property_Unit": map_a.get("property_unit") or "",
+        "Date_A": map_a.get("pressure_reference_date") or "",
+        "Date_B": map_b.get("pressure_reference_date") or "",
+        "Grid_Alignment": alignment,
+    }
+    return DeltaResult(grid_x=grid_x, grid_y=grid_y, grid_z=delta, metadata=metadata)
+
+
+def _parse_date(value) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def pressure_date_order(first: dict[str, object], second: dict[str, object]) -> tuple[dict[str, object], dict[str, object]] | None:
+    first_date = _parse_date(first.get("pressure_reference_date"))
+    second_date = _parse_date(second.get("pressure_reference_date"))
+    if first_date is None or second_date is None:
+        return None
+    return (first, second) if first_date <= second_date else (second, first)
+
+
+def calculate_pressure_change(first: dict[str, object], second: dict[str, object]) -> DeltaResult:
+    ordered = pressure_date_order(first, second)
+    if ordered is None:
+        raise ValueError("Pressure change requires both maps to have Pressure Map Reference Dates.")
+    earlier, later = ordered
+    result = calculate_delta(earlier, later, operation="Pressure Change = Later - Earlier")
+    result.metadata["Source_Map_Earlier"] = earlier.get("name")
+    result.metadata["Source_Map_Later"] = later.get("name")
+    result.metadata["Date_Earlier"] = earlier.get("pressure_reference_date") or ""
+    result.metadata["Date_Later"] = later.get("pressure_reference_date") or ""
+    return result
+
+
+def symmetric_delta_range(values) -> tuple[float, float] | None:
+    array = np.asarray(values, dtype=float)
+    valid = array[np.isfinite(array)]
+    if valid.size == 0:
+        return None
+    limit = float(np.nanmax(np.abs(valid)))
+    if limit == 0:
+        limit = 1.0
+    return -limit, limit

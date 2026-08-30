@@ -1,0 +1,68 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "Fault_Name": "F-North-Central",
+        "Fault_Type": "Panel boundary",
+        "Sealing": "Context only"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            424500,
+            3364566
+          ],
+          [
+            437500,
+            3364566
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "Fault_Name": "F-Central-South",
+        "Fault_Type": "Panel boundary",
+        "Sealing": "Context only"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            424500,
+            3362033
+          ],
+          [
+            437500,
+            3362033
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "Fault_Name": "F-Relay",
+        "Fault_Type": "Context fault",
+        "Sealing": "Unknown"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            430000,
+            3359900
+          ],
+          [
+            432200,
+            3367000
+          ]
+        ]
+      }
+    }
+  ]
+}
