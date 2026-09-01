@@ -26,6 +26,14 @@ def main() -> None:
             border: 1px solid #e5e7eb;
             border-radius: 6px;
             padding: 0.7rem 0.8rem;
+            color: #111827 !important;
+        }
+        div[data-testid="stMetric"] > div,
+        div[data-testid="stMetric"] label,
+        div[data-testid="stMetric"] p,
+        div[data-testid="stMetric"] span,
+        div[data-testid="stMetric"] strong {
+            color: #111827 !important;
         }
         div[data-testid="stAlert"] { border-radius: 6px; }
         </style>

@@ -54,12 +54,26 @@ def validate_geometry_layer(
     valid_features: list[GeometryFeature] = []
     extent_geometry = _well_extent_geometry(well_extent)
 
+    allowed_geometry_types = {
+        "Reservoir Boundary": {"Polygon", "MultiPolygon"},
+        "Panel / Compartment": {"Polygon", "MultiPolygon"},
+        "Fault": {"LineString", "MultiLineString"},
+        "Custom": {"Polygon", "MultiPolygon", "LineString", "MultiLineString"},
+    }
+    allowed = allowed_geometry_types.get(layer.layer_type)
+    if allowed is None:
+        raise ValueError(f"Unsupported layer type '{layer.layer_type}'.")
+
     for feature in layer.features:
         geometry = feature.geometry
         if geometry.is_empty:
             empty_features += 1
             issues.append(GeometryValidationIssue(feature.name, "error", "Geometry is empty."))
             continue
+        if geometry.geom_type not in allowed:
+            raise ValueError(
+                f"{layer.layer_type} geometry requires {', '.join(sorted(allowed))}, but feature '{feature.name}' is {geometry.geom_type}."
+            )
         if not geometry.is_valid:
             repaired, changed = repair_geometry(geometry)
             if changed and repaired.is_valid and not repaired.is_empty:

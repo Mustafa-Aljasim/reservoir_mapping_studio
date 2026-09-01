@@ -27,6 +27,9 @@ class GeometryLayer:
     features: list[GeometryFeature]
     source_name: str = ""
     name_attribute: str | None = None
+    extraction_dir: str | None = None
+    source_features: list[GeometryFeature] = field(default_factory=list)
+    polygonization_report: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_loaded(self) -> bool:

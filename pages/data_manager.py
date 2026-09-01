@@ -1,6 +1,8 @@
 """Data Manager page."""
 
 from __future__ import annotations
+
+import pandas as pd
 import streamlit as st
 
 from core.column_mapper import numeric_property_candidates, suggest_mappings
@@ -8,9 +10,12 @@ from core.data_loader import get_excel_sheet_names, load_uploaded_dataframe, sum
 from core.data_qc import build_qc_summary, duplicate_coordinate_rows, flag_outliers
 from core.geometry.loader import (
     geojson_property_names,
+    get_zipped_shapefile_candidates,
     load_geojson_bytes,
     load_geometry_csv,
     load_zipped_shapefile_bytes,
+    read_zipped_shapefile_fields,
+    read_zipped_shapefile_geometry_types,
     suggest_geometry_name_attribute,
 )
 from core.geometry.validation import layer_total_area, validate_geometry_layer
@@ -336,6 +341,8 @@ with geometry_tab:
         extension = uploaded_geometry.name.lower().rsplit(".", 1)[-1]
         name_attribute = None
         csv_df = None
+        shapefile_choice = None
+        convert_closed_linework = False
         try:
             raw_bytes = uploaded_geometry.getvalue()
             if extension in {"geojson", "json"}:
@@ -357,15 +364,61 @@ with geometry_tab:
                 group_col = st.selectbox("Polygon / Line ID Column", group_options, index=group_options.index(default_group))
                 name_attribute = None if group_col == "None" else group_col
             elif extension == "zip":
-                name_attribute = st.text_input("Name / ID Attribute", value="", key="zip_name_attribute") or None
+                zip_candidates = get_zipped_shapefile_candidates(raw_bytes)
+                shapefile_choice = st.selectbox(
+                    "Shapefile in ZIP",
+                    zip_candidates,
+                    index=0,
+                    key="zip_selected_shapefile",
+                    help="Choose the specific .shp to load when multiple shapefiles are present in the archive.",
+                )
+                zip_fields = read_zipped_shapefile_fields(raw_bytes, shapefile_choice)
+                zip_field_options = ["None"] + zip_fields
+                suggested_field = suggest_geometry_name_attribute(zip_fields)
+                default_field_index = zip_field_options.index(suggested_field) if suggested_field in zip_field_options else 0
+                selected_field = st.selectbox(
+                    "Name / ID Attribute",
+                    zip_field_options,
+                    index=default_field_index,
+                    key="zip_name_attribute",
+                )
+                name_attribute = None if selected_field == "None" else selected_field
+                if layer_type in {"Reservoir Boundary", "Panel / Compartment"}:
+                    detected_linework = read_zipped_shapefile_geometry_types(raw_bytes, shapefile_choice)
+                    if detected_linework["has_line_geometry"]:
+                        st.info("Boundary line geometry detected.")
+                        convert_closed_linework = st.checkbox(
+                            "Convert closed linework to polygons",
+                            value=False,
+                            key="convert_closed_linework",
+                        )
+                    else:
+                        convert_closed_linework = False
+                else:
+                    convert_closed_linework = False
 
             if st.button("Validate And Add Geometry", type="primary"):
                 if extension in {"geojson", "json"}:
-                    layer = load_geojson_bytes(raw_bytes, layer_type, layer_name, name_attribute, uploaded_geometry.name)
+                    layer = load_geojson_bytes(
+                        raw_bytes,
+                        layer_type,
+                        layer_name,
+                        name_attribute,
+                        uploaded_geometry.name,
+                        convert_closed_linework=convert_closed_linework if layer_type in {"Reservoir Boundary", "Panel / Compartment"} else False,
+                    )
                 elif extension == "csv" and csv_df is not None:
                     layer = load_geometry_csv(csv_df, layer_type, layer_name, geom_x_col, geom_y_col, name_attribute, uploaded_geometry.name)
                 elif extension == "zip":
-                    layer = load_zipped_shapefile_bytes(raw_bytes, layer_type, layer_name, name_attribute, uploaded_geometry.name)
+                    layer = load_zipped_shapefile_bytes(
+                        raw_bytes,
+                        layer_type,
+                        layer_name,
+                        name_attribute,
+                        uploaded_geometry.name,
+                        shapefile_choice,
+                        convert_closed_linework=convert_closed_linework,
+                    )
                 else:
                     raise ValueError("Unsupported geometry file type.")
 
