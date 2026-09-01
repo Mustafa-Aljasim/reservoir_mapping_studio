@@ -21,7 +21,7 @@ from core.geometry.assignment import assign_points_to_polygons, outside_panel_co
 from core.filtering import build_filter_column_list
 from core.grid import generate_grid
 from core.geometry.compartment import compartment_interpolate
-from core.geometry.masking import layer_keep_mask
+from core.geometry.masking import layer_keep_mask, polygon_union
 from core.geometry.models import GeometryLayer
 from core.geostatistics.variogram import compute_experimental_variogram, fit_candidate_models
 from core.interpolation import InterpolationError, interpolate_surface_result
@@ -96,6 +96,7 @@ def compute_surface_cached(
     method_parameters: dict,
     grid_parameters: dict,
     mask_parameters: dict,
+    domain_bounds: tuple[float, float, float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict]:
     data = np.asarray(records, dtype=float)
     if data.ndim != 2 or data.shape[1] != 3:
@@ -109,10 +110,12 @@ def compute_surface_cached(
         nx=int(grid_parameters["nx"]),
         ny=int(grid_parameters["ny"]),
         buffer_fraction=float(grid_parameters["buffer_fraction"]),
+        bounds=domain_bounds,
     )
     surface_result = interpolate_surface_result(x, y, z, grid_x, grid_y, method, method_parameters)
     grid_z = surface_result.estimate
     grid_variance = surface_result.variance
+    finite_before_mask = int(np.isfinite(grid_z).sum())
 
     mask_mode = mask_parameters.get("mode", "Convex Hull")
     max_distance_value = mask_parameters.get("max_distance")
@@ -140,6 +143,8 @@ def compute_surface_cached(
         "max_distance": max_distance_value,
         "masked_cells": int((~keep_mask).sum()),
         "valid_grid_cells": int(np.isfinite(masked_z).sum()),
+        "finite_grid_cells_before_mask": finite_before_mask,
+        "grid_cells_before_mask": int(grid_z.size),
     }
     return grid_x, grid_y, masked_z, masked_variance, info
 
@@ -903,7 +908,26 @@ with interpolation_tab:
         coordinate_unit,
         float(grid_parameters["buffer_fraction"]),
     )
-    mask_parameters = mask_controls(prepared, coordinate_unit, has_reservoir_boundary=reservoir_boundary_layer is not None)
+    mask_parameters = mask_controls(
+        prepared,
+        coordinate_unit,
+        has_reservoir_boundary=reservoir_boundary_layer is not None and bool(reservoir_boundary_layer.polygon_features),
+    )
+    domain_options = ["Well Data Extent"]
+    if reservoir_boundary_layer is not None and reservoir_boundary_layer.polygon_features:
+        domain_options.append("Reservoir Boundary Extent")
+    interpolation_domain = st.radio(
+        "Interpolation Domain",
+        domain_options,
+        index=len(domain_options) - 1 if len(domain_options) > 1 else 0,
+        horizontal=True,
+    )
+    reservoir_geometry = polygon_union(reservoir_boundary_layer.polygon_features) if reservoir_boundary_layer else None
+    domain_bounds = tuple(float(value) for value in reservoir_geometry.bounds) if interpolation_domain == "Reservoir Boundary Extent" and reservoir_geometry else None
+    if interpolation_domain == "Reservoir Boundary Extent" and reservoir_geometry is not None:
+        st.caption("The full rectangular reservoir bounding box will be interpolated before any polygon mask is applied.")
+    if method in {"Linear", "Cubic"} and interpolation_domain == "Reservoir Boundary Extent":
+        st.info("Linear and Cubic interpolation may remain NaN outside the convex hull of the observations.")
     st.caption(f"{len(prepared):,} finite included observation(s) will participate after duplicate handling.")
 
     if st.button("GENERATE / UPDATE MAP", type="primary", width="stretch"):
@@ -923,6 +947,7 @@ with interpolation_tab:
                             nx=int(grid_parameters["nx"]),
                             ny=int(grid_parameters["ny"]),
                             buffer_fraction=float(grid_parameters["buffer_fraction"]),
+                            bounds=domain_bounds,
                         )
                         compartment_result = compartment_interpolate(
                             prepared,
@@ -953,6 +978,7 @@ with interpolation_tab:
                             method_parameters,
                             grid_parameters,
                             mask_parameters,
+                            domain_bounds,
                         )
                         if "Reservoir Boundary" in mask_parameters.get("mode", "") and reservoir_boundary_layer is not None:
                             grid_z, grid_variance, geometry_mask_info = apply_surface_masks(
@@ -1023,6 +1049,8 @@ with interpolation_tab:
                     "method_parameters": method_parameters,
                     "grid_parameters": grid_parameters,
                     "mask_parameters": mask_parameters,
+                    "interpolation_domain": interpolation_domain,
+                    "domain_bounds": domain_bounds,
                     "mask_info": mask_info,
                     "respect_compartments": respect_compartments,
                     "geometry_context": {
@@ -1039,6 +1067,30 @@ with interpolation_tab:
                 st.success("Map generated.")
                 for warning in mask_info.get("compartment_warnings", []):
                     st.warning(warning)
+                well_extent = (
+                    float(prepared["X"].min()),
+                    float(prepared["Y"].min()),
+                    float(prepared["X"].max()),
+                    float(prepared["Y"].max()),
+                )
+                grid_extent = (
+                    float(grid_x.min()),
+                    float(grid_y.min()),
+                    float(grid_x.max()),
+                    float(grid_y.max()),
+                )
+                mask_info.update(
+                    {
+                        "well_extent": well_extent,
+                        "reservoir_extent": domain_bounds,
+                        "generated_grid_extent": grid_extent,
+                        "grid_cells_inside_reservoir": int(
+                            layer_keep_mask(reservoir_boundary_layer, grid_x, grid_y).sum()
+                        )
+                        if reservoir_boundary_layer is not None
+                        else int(grid_x.size),
+                    }
+                )
             except InterpolationError as exc:
                 st.error(str(exc))
             except ValueError as exc:
@@ -1055,6 +1107,10 @@ with map_tab:
     else:
         style = st.session_state.get("style_settings", {})
         layer_settings = st.session_state.get("layer_settings", {})
+        with st.expander("Spatial Debug Overlays", expanded=False):
+            show_debug_boundary = st.checkbox("Show Reservoir Boundary", value=True, key="debug_show_boundary")
+            show_grid_bbox = st.checkbox("Show Grid Bounding Box", value=False, key="debug_show_grid_bbox")
+            show_well_bbox = st.checkbox("Show Well Extent Bounding Box", value=False, key="debug_show_well_bbox")
         title = style.get("title_override") or generated.get("title")
         display_coordinate_unit = st.session_state.get("coordinate_unit", generated.get("coordinate_unit"))
         display_grid = generated["grid_z"]
@@ -1095,11 +1151,36 @@ with map_tab:
             surface_label=display_property,
             surface_unit=display_unit,
         )
+        diagnostics = generated.get("mask_info", {})
+        if show_grid_bbox:
+            x_min, y_min, x_max, y_max = diagnostics.get("generated_grid_extent", (None, None, None, None))
+            if x_min is not None:
+                figure.add_shape(
+                    type="rect",
+                    x0=x_min,
+                    y0=y_min,
+                    x1=x_max,
+                    y1=y_max,
+                    line={"color": "#DC2626", "dash": "dash", "width": 1.5},
+                    fillcolor="rgba(220, 38, 38, 0.03)",
+                )
+        if show_well_bbox:
+            x_min, y_min, x_max, y_max = diagnostics.get("well_extent", (None, None, None, None))
+            if x_min is not None:
+                figure.add_shape(
+                    type="rect",
+                    x0=x_min,
+                    y0=y_min,
+                    x1=x_max,
+                    y1=y_max,
+                    line={"color": "#16A34A", "dash": "dot", "width": 1.5},
+                    fillcolor="rgba(22, 163, 74, 0.03)",
+                )
         add_polygon_layer(
             figure,
             reservoir_boundary_layer,
             display_coordinate_unit,
-            visible=bool(layer_settings.get("show_reservoir_boundary", True)),
+            visible=bool(layer_settings.get("show_reservoir_boundary", True)) and show_debug_boundary,
             line_color="#0F172A",
             line_width=float(layer_settings.get("reservoir_boundary_width", 2.5)),
             fill_opacity=float(layer_settings.get("geometry_fill_opacity", 0.0)),
@@ -1162,6 +1243,26 @@ with map_tab:
             st.metric("Pressure Map Reference Date", format_map_date(generated.get("map_reference_date")))
         if generated.get("respect_compartments"):
             st.caption("Panel / compartment constraint: enabled. Each active panel was interpolated from its own observations.")
+
+        with st.expander("Spatial Domain Diagnostics", expanded=False):
+            def _extent_text(extent):
+                return "Unavailable" if extent is None else f"X {extent[0]:,.6g} to {extent[2]:,.6g}; Y {extent[1]:,.6g} to {extent[3]:,.6g}"
+
+            st.write(f"Well extent: {_extent_text(diagnostics.get('well_extent'))}")
+            st.write(f"Reservoir extent: {_extent_text(diagnostics.get('reservoir_extent'))}")
+            st.write(f"Generated grid extent: {_extent_text(diagnostics.get('generated_grid_extent'))}")
+            st.write(f"Grid dimensions: {generated['grid_x'].shape[1]} x {generated['grid_x'].shape[0]}")
+            if reservoir_boundary_layer is not None and reservoir_boundary_layer.polygon_features:
+                geometry = polygon_union(reservoir_boundary_layer.polygon_features)
+                st.write(f"Geometry type: {geometry.geom_type}")
+                st.write(f"Number of polygons: {len(reservoir_boundary_layer.polygon_features)}")
+                st.write(f"Boundary bounds: {_extent_text(tuple(float(value) for value in geometry.bounds))}")
+            st.write(f"Grid cells before mask: {diagnostics.get('grid_cells_before_mask', int(generated['grid_x'].size)):,}")
+            st.write(f"Grid cells inside reservoir: {diagnostics.get('grid_cells_inside_reservoir', int(generated['grid_x'].size)):,}")
+            st.write(
+                f"Grid cells with interpolated finite values: "
+                f"{diagnostics.get('finite_grid_cells_before_mask', int(np.isfinite(generated['grid_z']).sum())):,}"
+            )
 
         method_details = generated.get("method_parameters", {})
         if generated["method"] == "IDW":

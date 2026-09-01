@@ -35,14 +35,20 @@ def generate_grid(
     nx: int = 150,
     ny: int = 150,
     buffer_fraction: float = 0.03,
+    bounds: tuple[float, float, float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate a Cartesian mesh grid over the observation extent."""
+    """Generate a Cartesian mesh grid over observations or explicit bounds."""
 
     if nx < 2 or ny < 2:
         raise ValueError("Grid dimensions must be at least 2 by 2.")
 
-    x_min, x_max = coordinate_limits(x, buffer_fraction)
-    y_min, y_max = coordinate_limits(y, buffer_fraction)
+    if bounds is None:
+        x_min, x_max = coordinate_limits(x, buffer_fraction)
+        y_min, y_max = coordinate_limits(y, buffer_fraction)
+    else:
+        x_min, y_min, x_max, y_max = (float(value) for value in bounds)
+        if not np.isfinite([x_min, y_min, x_max, y_max]).all() or x_min > x_max or y_min > y_max:
+            raise ValueError("Grid bounds must be finite and ordered as min X, min Y, max X, max Y.")
     grid_x, grid_y = np.meshgrid(
         np.linspace(x_min, x_max, int(nx)),
         np.linspace(y_min, y_max, int(ny)),

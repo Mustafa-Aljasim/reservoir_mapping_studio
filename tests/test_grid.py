@@ -22,3 +22,18 @@ def test_coordinate_limits_expand_with_fractional_buffer():
     assert np.isclose(low, -5)
     assert np.isclose(high, 105)
 
+
+def test_grid_uses_explicit_domain_bounds_without_observation_buffer():
+    grid_x, grid_y = generate_grid(
+        [40, 60],
+        [40, 60],
+        nx=5,
+        ny=4,
+        buffer_fraction=0.5,
+        bounds=(0, 10, 100, 80),
+    )
+    assert np.isclose(grid_x.min(), 0)
+    assert np.isclose(grid_x.max(), 100)
+    assert np.isclose(grid_y.min(), 10)
+    assert np.isclose(grid_y.max(), 80)
+
