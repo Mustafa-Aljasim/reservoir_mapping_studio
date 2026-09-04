@@ -30,7 +30,12 @@ from utils.constants import (
 )
 from core.crs import LOCAL_CRS_MODE, local_crs
 from core.geometry.compartment import panel_feature_names
-from core.layer_mapping import LAYER_MAPPING_SCOPES, LAYER_SCOPE_ALL, LAYER_SCOPE_SELECTED
+from core.layer_mapping import (
+    DOMAIN_WELL_DATA_EXTENT,
+    LAYER_MAPPING_SCOPES,
+    LAYER_SCOPE_ALL,
+    LAYER_SCOPE_SELECTED,
+)
 from core.pressure_dates import format_map_date, validate_date_column
 from utils.units import coordinate_unit_key_from_label, coordinate_unit_label, coordinate_unit_labels
 
@@ -64,6 +69,7 @@ def ensure_session_state() -> None:
         "selected_panels": [],
         "panel_interpolation_mode": PANEL_MODE_COMBINED,
         "layer_mapping_scope": "Selected Layer",
+        "mapping_interpolation_domain": DOMAIN_WELL_DATA_EXTENT,
         "selected_reservoir_layer": None,
         "active_generated_layer": None,
         "generated_layer_maps": {},
@@ -158,6 +164,7 @@ def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | N
     st.session_state.selected_panels = []
     st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
     st.session_state.layer_mapping_scope = "Selected Layer"
+    st.session_state.mapping_interpolation_domain = DOMAIN_WELL_DATA_EXTENT
     st.session_state.selected_reservoir_layer = None
     st.session_state.active_generated_layer = None
     st.session_state.generated_layer_maps = {}
@@ -215,6 +222,7 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
     st.session_state.selected_panels = []
     st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
     st.session_state.layer_mapping_scope = "Selected Layer"
+    st.session_state.mapping_interpolation_domain = DOMAIN_WELL_DATA_EXTENT
     st.session_state.selected_reservoir_layer = None
     st.session_state.active_generated_layer = None
     st.session_state.generated_layer_maps = {}

@@ -112,9 +112,11 @@ DUPLICATE_METHODS = ("Average", "Median", "Keep first", "Keep last")
 
 MASK_OPTIONS = (
     "Reservoir Boundary",
+    "Selected Panel Union",
     "Convex Hull",
     "Maximum Distance",
     "Reservoir Boundary + Maximum Distance",
+    "Selected Panel Union + Maximum Distance",
     "Convex Hull + Maximum Distance",
     "No Mask",
 )

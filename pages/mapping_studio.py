@@ -45,15 +45,21 @@ from core.geostatistics.variogram import (
     compute_experimental_variogram,
     fit_candidate_models,
 )
+from core.crs import crs_coordinate_unit_warning, crs_display_name
 from core.interpolation.rbf import estimate_epsilon
 from core.layer_mapping import (
+    DOMAIN_RESERVOIR_BOUNDARY_EXTENT,
+    DOMAIN_SELECTED_PANEL_UNION_EXTENT,
+    DOMAIN_WELL_DATA_EXTENT,
     LAYER_SCOPE_ALL,
     LAYER_SCOPE_SELECTED,
     MAP_STATUS_UP_TO_DATE,
     UNSPECIFIED_LAYER,
     build_layer_model_signature,
+    coerce_interpolation_domain_selection,
     filter_values_excluding_semantics,
     generate_layer_map_collection,
+    interpolation_domain_options,
     layer_column,
     map_status,
     prepare_layer_observations,
@@ -62,7 +68,6 @@ from core.layer_mapping import (
     resolve_layer_method_parameters,
     select_generated_layer_map,
 )
-from core.map_context import build_map_metadata
 from core.masking import auto_maximum_distance
 from core.pressure_dates import format_map_date, summarize_measurement_dates
 from core.plotting.geometry_layers import add_fault_layer, add_polygon_layer
@@ -103,13 +108,23 @@ from utils.constants import (
     RBF_KERNELS,
 )
 from utils.export import (
+    GEOTIFF_NODATA,
+    ZMAP_NULL_VALUE,
+    batch_map_package_zip_bytes,
+    build_map_export_metadata,
+    control_regions_export_dataframe,
     dataframe_to_csv_bytes,
     dataframe_to_excel_bytes,
     drop_internal_columns,
+    engineering_controls_export_dataframe,
     figure_to_image_bytes,
     grid_to_dataframe,
     grid_to_excel_bytes,
+    grid_to_xyz_ascii_bytes,
     map_package_zip_bytes,
+    map_base_filename,
+    map_geotiff_export_files,
+    map_zmap_export_files,
     metadata_to_json_bytes,
 )
 from utils.units import coordinate_unit_symbol, format_distance
@@ -163,37 +178,41 @@ def convert_observations_for_display(
     return converted
 
 
+def render_static_image_export_controls(figure, base_name: str) -> None:
+    export_cols = st.columns(4)
+    with export_cols[0]:
+        width = st.number_input("Image Width", min_value=600, max_value=6000, value=1800, step=100)
+    with export_cols[1]:
+        height = st.number_input("Image Height", min_value=400, max_value=5000, value=1100, step=100)
+    with export_cols[2]:
+        scale = st.number_input("Image Scale", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
+    with export_cols[3]:
+        show_legend = st.checkbox("Legend", value=True)
+    export_title = st.text_input("Export Title", value=str(figure.layout.title.text or base_name))
+    export_figure = go.Figure(figure.to_plotly_json())
+    export_figure.update_layout(title=export_title, showlegend=show_legend)
+    if st.button("PREPARE MAP IMAGE EXPORTS"):
+        try:
+            st.session_state.map_image_exports = {
+                "png": figure_to_image_bytes(export_figure, "png", int(width), int(height), float(scale)),
+                "svg": figure_to_image_bytes(export_figure, "svg", int(width), int(height), float(scale)),
+                "pdf": figure_to_image_bytes(export_figure, "pdf", int(width), int(height), float(scale)),
+                "base_name": base_name,
+            }
+            st.success("Image exports prepared.")
+        except RuntimeError as exc:
+            st.error(str(exc))
+    exports = st.session_state.get("map_image_exports", {})
+    if exports:
+        button_cols = st.columns(3)
+        button_cols[0].download_button("Download PNG", exports["png"], f"{exports['base_name']}.png", "image/png")
+        button_cols[1].download_button("Download SVG", exports["svg"], f"{exports['base_name']}.svg", "image/svg+xml")
+        button_cols[2].download_button("Download PDF", exports["pdf"], f"{exports['base_name']}.pdf", "application/pdf")
+
+
 def render_static_image_exports(figure, base_name: str) -> None:
     with st.expander("Image Export", expanded=False):
-        export_cols = st.columns(4)
-        with export_cols[0]:
-            width = st.number_input("Image Width", min_value=600, max_value=6000, value=1800, step=100)
-        with export_cols[1]:
-            height = st.number_input("Image Height", min_value=400, max_value=5000, value=1100, step=100)
-        with export_cols[2]:
-            scale = st.number_input("Image Scale", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
-        with export_cols[3]:
-            show_legend = st.checkbox("Legend", value=True)
-        export_title = st.text_input("Export Title", value=str(figure.layout.title.text or base_name))
-        export_figure = go.Figure(figure.to_plotly_json())
-        export_figure.update_layout(title=export_title, showlegend=show_legend)
-        if st.button("PREPARE MAP IMAGE EXPORTS"):
-            try:
-                st.session_state.map_image_exports = {
-                    "png": figure_to_image_bytes(export_figure, "png", int(width), int(height), float(scale)),
-                    "svg": figure_to_image_bytes(export_figure, "svg", int(width), int(height), float(scale)),
-                    "pdf": figure_to_image_bytes(export_figure, "pdf", int(width), int(height), float(scale)),
-                    "base_name": base_name,
-                }
-                st.success("Image exports prepared.")
-            except RuntimeError as exc:
-                st.error(str(exc))
-        exports = st.session_state.get("map_image_exports", {})
-        if exports:
-            button_cols = st.columns(3)
-            button_cols[0].download_button("Download PNG", exports["png"], f"{exports['base_name']}.png", "image/png")
-            button_cols[1].download_button("Download SVG", exports["svg"], f"{exports['base_name']}.svg", "image/svg+xml")
-            button_cols[2].download_button("Download PDF", exports["pdf"], f"{exports['base_name']}.pdf", "application/pdf")
+        render_static_image_export_controls(figure, base_name)
 
 
 def method_parameter_controls(
@@ -382,12 +401,26 @@ def grid_controls() -> dict[str, object]:
     return {"preset": preset, "nx": int(nx), "ny": int(ny), "buffer_fraction": float(buffer_percent) / 100.0}
 
 
-def mask_controls(prepared: pd.DataFrame, coordinate_unit: str, has_reservoir_boundary: bool = False) -> dict[str, object]:
+def mask_controls(
+    prepared: pd.DataFrame,
+    coordinate_unit: str,
+    has_reservoir_boundary: bool = False,
+    has_selected_panel_union: bool = False,
+) -> dict[str, object]:
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
     options = list(MASK_OPTIONS)
     if not has_reservoir_boundary:
         options = [option for option in options if "Reservoir Boundary" not in option]
-    mode = st.radio("Mask", options, index=0)
+    if not has_selected_panel_union:
+        options = [option for option in options if "Selected Panel Union" not in option]
+    if not options:
+        options = ["No Mask"]
+    mask_key = "mapping_mask_mode"
+    if mask_key not in st.session_state:
+        st.session_state[mask_key] = options[0]
+    elif st.session_state[mask_key] not in options:
+        st.session_state[mask_key] = options[0]
+    mode = st.radio("Spatial Mask", options=options, key=mask_key)
     max_distance = None
     distance_mode = None
     if "Maximum Distance" in mode:
@@ -844,6 +877,16 @@ def layer_map_key(generated_map: dict[str, object]) -> str:
     return UNSPECIFIED_LAYER
 
 
+def current_open_scenario() -> dict[str, object] | None:
+    current_id = st.session_state.get("current_scenario_id")
+    if not current_id:
+        return None
+    for scenario in st.session_state.get("map_scenarios", []) or []:
+        if scenario.get("id") == current_id:
+            return scenario
+    return None
+
+
 def render_status(status: str) -> None:
     if status == MAP_STATUS_UP_TO_DATE:
         st.success(f"Map Status: {status}")
@@ -1029,6 +1072,9 @@ with controls_col:
             f"Spatial distances use {coordinate_unit_symbol(coordinate_unit)}. "
             "Uploaded X/Y coordinates are not converted."
         )
+        unit_warning = crs_coordinate_unit_warning(st.session_state.get("crs", {}), coordinate_unit)
+        if unit_warning:
+            st.warning(unit_warning)
         current_property = st.session_state.get("current_property")
         if current_property not in property_options:
             current_property = property_options[0]
@@ -1098,6 +1144,7 @@ with controls_col:
 
         active_for_layers = pd.DataFrame()
         try:
+            panel_selection_for_layers = selected_panels if panel_layer is not None and mappings.get("panel") else None
             active_for_layers = prepare_active_property_data(
                 df,
                 mappings,
@@ -1105,16 +1152,8 @@ with controls_col:
                 property_type,
                 pressure_reference_date,
                 filter_values_no_layer,
-                selected_panels if panel_layer is not None else None,
+                panel_selection_for_layers,
             ).dataframe
-            if selected_panels and panel_layer is not None and not mappings.get("panel"):
-                active_for_layers = filter_dataframe_to_selected_panels(
-                    active_for_layers,
-                    x_col,
-                    y_col,
-                    panel_layer,
-                    selected_panels,
-                )
         except ValueError as exc:
             st.warning(str(exc))
 
@@ -1402,15 +1441,18 @@ with controls_col:
                 st.session_state.get("engineering_control_region_source"),
                 st.session_state.get("engineering_control_region_source"),
             )
-            if current_source not in source_options:
-                current_source = DRAWN_CONTROL_REGION_SOURCE
-            st.session_state.engineering_control_region_source = current_source
+            region_source_key = "engineering_control_region_source"
+            if region_source_key not in st.session_state:
+                st.session_state[region_source_key] = DRAWN_CONTROL_REGION_SOURCE
+            else:
+                st.session_state[region_source_key] = (
+                    current_source if current_source in source_options else DRAWN_CONTROL_REGION_SOURCE
+                )
             region_source = st.radio(
                 "Region Source",
-                source_options,
-                index=source_options.index(current_source),
+                options=source_options,
                 horizontal=True,
-                key="engineering_control_region_source",
+                key=region_source_key,
             )
             region_name = st.text_input("Region Name", key="engineering_control_region_name")
             region_scope_layer = controls_scope_layer
@@ -1772,26 +1814,25 @@ with controls_col:
             coordinate_unit,
             float(grid_parameters["buffer_fraction"]),
         )
-        mask_parameters = mask_controls(
-            prepared,
-            coordinate_unit,
-            has_reservoir_boundary=reservoir_boundary_layer is not None and bool(reservoir_boundary_layer.polygon_features),
-        )
-        domain_options = ["Well Data Extent"]
-        if reservoir_boundary_layer is not None and reservoir_boundary_layer.polygon_features:
-            domain_options.append("Reservoir Boundary Extent")
         selected_panel_domain_bounds = selected_panel_bounds(panel_layer, selected_panels)
-        if selected_panel_domain_bounds is not None:
-            domain_options.append("Selected Panel Extent")
-        current_domain = st.session_state.get("mapping_interpolation_domain")
-        if current_domain not in domain_options:
-            current_domain = domain_options[-1] if len(domain_options) > 1 else domain_options[0]
+        st.markdown("##### Spatial Domain")
+        domain_options = interpolation_domain_options(
+            has_reservoir_boundary=reservoir_boundary_layer is not None and bool(reservoir_boundary_layer.polygon_features),
+            has_selected_panel_union=selected_panel_domain_bounds is not None,
+        )
+        domain_key = "mapping_interpolation_domain"
+        if domain_key not in st.session_state:
+            st.session_state[domain_key] = domain_options[0]
+        else:
+            st.session_state[domain_key] = coerce_interpolation_domain_selection(
+                st.session_state[domain_key],
+                domain_options,
+            )
         interpolation_domain = st.radio(
             "Interpolation Domain",
-            domain_options,
-            index=domain_options.index(current_domain),
+            options=domain_options,
             horizontal=True,
-            key="mapping_interpolation_domain",
+            key=domain_key,
         )
         domain_bounds = resolve_domain_bounds(
             interpolation_domain,
@@ -1799,12 +1840,20 @@ with controls_col:
             panel_layer,
             selected_panels,
         )
-        if interpolation_domain == "Reservoir Boundary Extent":
-            st.caption("The full rectangular reservoir bounding box will be interpolated before any polygon mask is applied.")
-        if interpolation_domain == "Selected Panel Extent":
-            st.caption("The selected panel union bounds will be interpolated before panel or reservoir masks are applied.")
-        if method in {"Linear", "Cubic"} and interpolation_domain == "Reservoir Boundary Extent":
+        if interpolation_domain == DOMAIN_RESERVOIR_BOUNDARY_EXTENT:
+            st.caption("The full rectangular reservoir boundary extent will be interpolated before any polygon mask is applied.")
+        if interpolation_domain == DOMAIN_SELECTED_PANEL_UNION_EXTENT:
+            st.caption("The selected panel polygon union extent will be interpolated before any spatial mask is applied.")
+        if method in {"Linear", "Cubic"} and interpolation_domain != DOMAIN_WELL_DATA_EXTENT:
             st.info("Linear and Cubic interpolation may remain NaN outside the convex hull of the observations.")
+
+        st.markdown("##### Spatial Mask")
+        mask_parameters = mask_controls(
+            prepared,
+            coordinate_unit,
+            has_reservoir_boundary=reservoir_boundary_layer is not None and bool(reservoir_boundary_layer.polygon_features),
+            has_selected_panel_union=selected_panel_domain_bounds is not None,
+        )
         interpolation_control_selection = control_selection_for_layer(preview_layer, filtered_with_include)
         st.caption(
             f"{len(prepared):,} finite included measured observation(s) and "
@@ -2035,6 +2084,7 @@ context_bounds = draw_payload_bounds(
     context_lines,
 )
 
+current_plot_figure = None
 
 with map_col:
     generated_layer_maps = dict(st.session_state.get("generated_layer_maps", {}) or {})
@@ -2145,6 +2195,7 @@ with map_col:
             show_region_points=bool(context_layer_settings.get("show_region_control_points", False)),
         )
         move_observation_traces_to_top(figure)
+        current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
         if is_pressure_map and pressure_reference_date:
             st.metric("Pressure Map Reference Date", format_map_date(pressure_reference_date))
@@ -2312,6 +2363,7 @@ with map_col:
             show_region_points=bool(layer_settings.get("show_region_control_points", False)),
         )
         move_observation_traces_to_top(figure)
+        current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
 
         info_cols = st.columns(6)
@@ -2335,6 +2387,8 @@ with map_col:
         with st.expander("Spatial Domain Diagnostics", expanded=False):
             st.write(f"Well extent: {extent_text(diagnostics.get('well_extent'))}")
             st.write(f"Reservoir extent: {extent_text(diagnostics.get('reservoir_extent'))}")
+            panel_union_extent = (generated.get("geometry_references", {}) or {}).get("selected_panel_bounds")
+            st.write(f"Selected panel union extent: {extent_text(panel_union_extent)}")
             st.write(f"Generated grid extent: {extent_text(diagnostics.get('generated_grid_extent'))}")
             st.write(f"Grid dimensions: {generated['grid_x'].shape[1]} x {generated['grid_x'].shape[0]}")
             if reservoir_boundary_layer is not None and reservoir_boundary_layer.polygon_features:
@@ -2348,6 +2402,7 @@ with map_col:
                 f"Grid cells with interpolated finite values: "
                 f"{diagnostics.get('finite_grid_cells_before_mask', int(np.isfinite(generated['grid_z']).sum())):,}"
             )
+            st.write(f"Finite cells after mask: {diagnostics.get('valid_grid_cells', int(np.isfinite(generated['grid_z']).sum())):,}")
 
         method_details = generated.get("method_parameters", {})
         if generated["method"] == "IDW":
@@ -2369,8 +2424,6 @@ with map_col:
                     f"Kriging variance range: {valid_variance.min():.4g} to {valid_variance.max():.4g}; "
                     f"standard deviation range: {np.sqrt(valid_variance).min():.4g} to {np.sqrt(valid_variance).max():.4g}."
                 )
-
-        render_static_image_exports(figure, f"{generated['property_col']}_{layer_map_key(generated)}")
 
 with controls_col:
     with st.expander("Map Library", expanded=False):
@@ -2452,6 +2505,8 @@ with controls_col:
             st.caption("No saved map scenarios yet.")
 
     with st.expander("Export", expanded=False):
+        st.markdown("#### EXPORT")
+        project_metadata = dict(st.session_state.get("project_metadata", {}) or {})
         current_for_export = filtered_with_include.copy()
         included_for_export = (
             current_for_export[current_for_export[INCLUDE_COLUMN]].copy()
@@ -2459,103 +2514,54 @@ with controls_col:
             else current_for_export
         )
         export_clean = drop_internal_columns(included_for_export)
-        export_cols = st.columns(2)
-        with export_cols[0]:
-            st.download_button(
-                "Download Active Observations CSV",
-                dataframe_to_csv_bytes(export_clean),
-                file_name="active_map_observations.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        with export_cols[1]:
-            st.download_button(
-                "Download Active Observations Excel",
-                dataframe_to_excel_bytes(export_clean, "Active Observations"),
-                file_name="active_map_observations.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-            )
+
+        st.markdown("##### Grid / Engineering Data")
+        observation_cols = st.columns(2)
+        observation_cols[0].download_button(
+            "Active Observations CSV",
+            dataframe_to_csv_bytes(export_clean),
+            file_name="active_map_observations.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        observation_cols[1].download_button(
+            "Active Observations Excel",
+            dataframe_to_excel_bytes(export_clean, "Active Observations"),
+            file_name="active_map_observations.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
 
         generated = st.session_state.get("generated_map")
-        if generated:
-            export_coordinate_unit = st.session_state.get("coordinate_unit", generated.get("coordinate_unit"))
-            engineering_control_export = generated.get("engineering_controls", pd.DataFrame())
-            if not isinstance(engineering_control_export, pd.DataFrame):
-                engineering_control_export = pd.DataFrame(engineering_control_export)
-            export_metadata = build_map_metadata(
-                generated["property_col"],
-                generated.get("unit"),
-                generated["x_col"],
-                generated["y_col"],
-                export_coordinate_unit,
-                generated["method"],
-                generated["grid_parameters"],
-                generated["method_parameters"],
-                generated["mask_parameters"],
-                generated["duplicate_method"],
-                is_pressure_map=bool(generated.get("is_pressure_map")),
-                map_reference_date=generated.get("map_reference_date"),
-                geometry_context={
-                    "reservoir_boundary_used": "Reservoir Boundary" in generated["mask_parameters"].get("mode", ""),
-                    "panel_constraint_used": bool(generated.get("respect_compartments")),
-                    "active_panels": ", ".join(str(value) for value in generated.get("selected_panels", [])),
-                    "fault_layer_loaded": fault_layer is not None,
-                    "custom_layer_count": len(custom_layers),
-                    **(generated.get("geometry_references", {}) or {}),
-                },
-                property_type=generated.get("property_type") or ("Pressure" if generated.get("is_pressure_map") else "Generic"),
-                crs=st.session_state.get("crs", {}),
-                selected_panels=generated.get("selected_panels", []),
-                selected_layers=generated.get("selected_layers", []),
-                panel_interpolation_mode=generated.get("panel_interpolation_mode"),
-                interpolation_domain=generated.get("interpolation_domain"),
-                domain_bounds=generated.get("domain_bounds"),
-                grid_x=generated.get("grid_x"),
-                grid_y=generated.get("grid_y"),
-                validation_metrics=generated.get("validation_metrics", {}),
-                model_signature_hash=(generated.get("model_signature") or {}).get("hash", ""),
-                reservoir_layer=generated.get("reservoir_layer"),
-                layer_mapping_scope=generated.get("layer_mapping_scope"),
-                measured_observation_count=generated.get(
-                    "measured_observation_count",
-                    len(generated.get("included_observations", [])),
-                ),
-                engineering_control_count=generated.get("engineering_control_count", len(engineering_control_export)),
-                control_region_count=generated.get("control_region_count", 0),
-                control_point_ids=engineering_control_export.get("Control_ID", pd.Series(dtype=object)).dropna().tolist()
-                if not engineering_control_export.empty
-                else [],
-                control_region_ids=[
-                    region.get("Region_ID") for region in generated.get("engineering_control_regions", []) or []
-                ],
+        if not generated:
+            st.caption("Generate a map before exporting an interpolated grid, raster, ZMAP, image, or map metadata.")
+        else:
+            active_scenario = current_open_scenario()
+            base_name = map_base_filename(generated, project_metadata=project_metadata)
+            export_metadata = build_map_export_metadata(
+                generated,
+                project_metadata=project_metadata,
+                scenario=active_scenario,
+                nodata=GEOTIFF_NODATA,
             )
+            controls_export = engineering_controls_export_dataframe(generated)
+            regions_export = control_regions_export_dataframe(generated)
+            validation_metrics = generated.get("validation_metrics", {})
+            validation_export = pd.DataFrame([validation_metrics]) if validation_metrics else pd.DataFrame()
+
             metadata_summary = [
-                f"Property: {generated['property_col']}",
-                f"Coordinate Unit: {coordinate_unit_symbol(export_coordinate_unit)}",
-                f"Interpolation: {generated['method']}",
+                f"Property: {export_metadata.get('Property')}",
+                f"Stored / Original Unit: {export_metadata.get('Property_Unit') or 'unitless'}",
+                f"Display Unit: {display_unit or 'unitless'}",
+                f"Export Unit: original",
+                f"CRS: {crs_display_name(generated.get('crs') or {'mode': export_metadata.get('CRS_Mode'), 'epsg': export_metadata.get('CRS_EPSG')})}",
             ]
             if generated.get("reservoir_layer"):
                 metadata_summary.append(f"Layer: {generated.get('reservoir_layer')}")
             if generated.get("is_pressure_map") and generated.get("map_reference_date"):
                 metadata_summary.append(f"Reference Date: {format_map_date(generated.get('map_reference_date'))}")
             st.caption(" | ".join(metadata_summary))
-            if not engineering_control_export.empty:
-                controls_export_cols = st.columns(2)
-                controls_export_cols[0].download_button(
-                    "Download Engineering Controls CSV",
-                    dataframe_to_csv_bytes(engineering_control_export),
-                    file_name="engineering_controls.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
-                controls_export_cols[1].download_button(
-                    "Download Engineering Controls Excel",
-                    dataframe_to_excel_bytes(engineering_control_export, "Engineering Controls"),
-                    file_name="engineering_controls.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
+
             include_nan = st.checkbox("Include masked cells in grid export", value=False)
             grid_export = grid_to_dataframe(
                 generated["grid_x"],
@@ -2566,36 +2572,176 @@ with controls_col:
                 grid_variance=generated.get("grid_variance"),
                 panel_grid=generated.get("panel_grid"),
             )
-            grid_cols = st.columns(2)
-            with grid_cols[0]:
-                st.download_button(
-                    "Download Grid CSV",
-                    dataframe_to_csv_bytes(grid_export),
-                    file_name="interpolated_grid.csv",
-                    mime="text/csv",
-                    width="stretch",
+            grid_cols = st.columns(3)
+            grid_cols[0].download_button(
+                "CSV",
+                dataframe_to_csv_bytes(grid_export),
+                file_name=f"{base_name}.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+            grid_cols[1].download_button(
+                "XYZ ASCII",
+                grid_to_xyz_ascii_bytes(grid_export),
+                file_name=f"{base_name}.xyz",
+                mime="text/plain",
+                width="stretch",
+            )
+            grid_cols[2].download_button(
+                "Excel",
+                grid_to_excel_bytes(
+                    grid_export,
+                    export_metadata,
+                    engineering_controls=controls_export,
+                    control_regions=regions_export,
+                    validation_df=validation_export,
+                ),
+                file_name=f"{base_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+
+            st.markdown("##### GIS Raster")
+            if export_metadata.get("CRS_Mode") == "Local / Unknown XY":
+                st.info("CRS is undefined. The GeoTIFF preserves local XY geometry but has no EPSG spatial reference.")
+            try:
+                geotiff_files = map_geotiff_export_files(
+                    generated,
+                    project_metadata=project_metadata,
+                    scenario=active_scenario,
                 )
-                st.download_button(
-                    "Download Metadata JSON",
-                    metadata_to_json_bytes(export_metadata),
-                    file_name="map_metadata.json",
-                    mime="application/json",
-                    width="stretch",
+                geotiff_cols = st.columns(min(3, max(1, len(geotiff_files))))
+                for index, (filename, data, geotiff_metadata) in enumerate(geotiff_files):
+                    label = str(geotiff_metadata.get("Export_Value") or "GeoTIFF")
+                    geotiff_cols[index % len(geotiff_cols)].download_button(
+                        f"{label} GeoTIFF",
+                        data,
+                        file_name=filename,
+                        mime="image/tiff",
+                        width="stretch",
+                    )
+            except Exception as exc:
+                st.warning(f"GeoTIFF export unavailable: {exc}")
+
+            st.markdown("##### ZMAP Grid ASCII")
+            try:
+                zmap_files = map_zmap_export_files(
+                    generated,
+                    project_metadata=project_metadata,
+                    scenario=active_scenario,
                 )
-            with grid_cols[1]:
+                for zmap_name, zmap_data, metadata_name, metadata_data, zmap_metadata in zmap_files:
+                    zmap_cols = st.columns(2)
+                    label = str(zmap_metadata.get("Export_Value") or "ZMAP")
+                    zmap_cols[0].download_button(
+                        f"{label} ZMAP",
+                        zmap_data,
+                        file_name=zmap_name,
+                        mime="text/plain",
+                        width="stretch",
+                    )
+                    zmap_cols[1].download_button(
+                        f"{label} ZMAP Metadata JSON",
+                        metadata_data,
+                        file_name=metadata_name,
+                        mime="application/json",
+                        width="stretch",
+                    )
+            except Exception as exc:
+                st.warning(f"ZMAP export unavailable: {exc}")
+
+            st.markdown("##### Metadata")
+            st.download_button(
+                "Map Metadata JSON",
+                metadata_to_json_bytes(export_metadata),
+                file_name=f"{base_name}_metadata.json",
+                mime="application/json",
+                width="stretch",
+            )
+
+            st.markdown("##### Engineering Controls")
+            if controls_export.empty and regions_export.empty:
+                st.caption("No engineering controls or soft control regions are active in this map.")
+            else:
+                control_cols = st.columns(2)
+                if not controls_export.empty:
+                    control_cols[0].download_button(
+                        "Controls CSV",
+                        dataframe_to_csv_bytes(controls_export),
+                        file_name=f"{base_name}_engineering_controls.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+                    control_cols[1].download_button(
+                        "Controls Excel",
+                        dataframe_to_excel_bytes(controls_export, "Engineering Controls"),
+                        file_name=f"{base_name}_engineering_controls.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
+                    )
+                if not regions_export.empty:
+                    region_cols = st.columns(2)
+                    region_cols[0].download_button(
+                        "Control Regions CSV",
+                        dataframe_to_csv_bytes(regions_export),
+                        file_name=f"{base_name}_control_regions.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+                    region_cols[1].download_button(
+                        "Control Regions Excel",
+                        dataframe_to_excel_bytes(regions_export, "Control Regions"),
+                        file_name=f"{base_name}_control_regions.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
+                    )
+
+            st.markdown("##### Package")
+            st.download_button(
+                "Map Package ZIP",
+                map_package_zip_bytes(
+                    grid_export,
+                    export_metadata,
+                    figure=current_plot_figure,
+                    validation_df=validation_export,
+                    engineering_controls=controls_export,
+                    control_regions=regions_export,
+                ),
+                file_name=f"{base_name}_package.zip",
+                mime="application/zip",
+                width="stretch",
+            )
+
+            if generated_layer_maps and len(generated_layer_maps) > 1:
+                st.markdown("##### Batch Multi-Layer Export")
+                batch_cols = st.columns(4)
+                include_geotiff = batch_cols[0].checkbox("GeoTIFF", value=True, key="batch_export_geotiff")
+                include_zmap = batch_cols[1].checkbox("ZMAP", value=True, key="batch_export_zmap")
+                include_xyz = batch_cols[2].checkbox("CSV / XYZ", value=True, key="batch_export_xyz")
+                include_excel = batch_cols[3].checkbox("Excel", value=False, key="batch_export_excel")
+                selected_formats = {"metadata"}
+                if include_geotiff:
+                    selected_formats.add("geotiff")
+                if include_zmap:
+                    selected_formats.add("zmap")
+                if include_xyz:
+                    selected_formats.update({"csv", "xyz"})
+                if include_excel:
+                    selected_formats.add("excel")
                 st.download_button(
-                    "Download Grid Excel",
-                    grid_to_excel_bytes(grid_export, export_metadata),
-                    file_name="interpolated_grid.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
-                st.download_button(
-                    "Download Map Package ZIP",
-                    map_package_zip_bytes(grid_export, export_metadata),
-                    file_name="map_package.zip",
+                    "Export All Generated Layers ZIP",
+                    batch_map_package_zip_bytes(
+                        generated_layer_maps,
+                        project_metadata=project_metadata,
+                        include_formats=selected_formats,
+                    ),
+                    file_name=f"{base_name}_all_layers_export.zip",
                     mime="application/zip",
                     width="stretch",
                 )
-        else:
-            st.caption("Generate a map before exporting an interpolated grid.")
+
+            st.markdown("##### Image")
+            if current_plot_figure is not None:
+                render_static_image_export_controls(current_plot_figure, base_name)
+            else:
+                st.caption("Image export is available after the map figure has rendered.")

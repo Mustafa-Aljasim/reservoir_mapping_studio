@@ -24,6 +24,7 @@ from core.engineering_controls import (
 )
 from core.geometry.loader import load_geojson_bytes
 from core.geometry.models import GeometryLayer
+from core.layer_mapping import DOMAIN_WELL_DATA_EXTENT, normalize_interpolation_domain
 from core.geostatistics.variogram import ExperimentalVariogram, VariogramFit
 from core.scenarios import json_safe, scenario_metadata
 from utils.constants import INTERNAL_ROW_ID
@@ -225,6 +226,9 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "pressure_reference_date": state.get("pressure_reference_date"),
         "selected_panels": state.get("selected_panels", []),
         "panel_interpolation_mode": panel_mode_from_legacy(state.get("panel_interpolation_mode"), False),
+        "mapping_interpolation_domain": normalize_interpolation_domain(
+            state.get("mapping_interpolation_domain", DOMAIN_WELL_DATA_EXTENT)
+        ),
         "layer_mapping_scope": state.get("layer_mapping_scope", "Selected Layer"),
         "selected_reservoir_layer": state.get("selected_reservoir_layer"),
         "active_generated_layer": state.get("active_generated_layer"),
@@ -343,6 +347,9 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             "pressure_reference_date": _parse_iso_date(manifest.get("pressure_reference_date")),
             "selected_panels": manifest.get("selected_panels", []),
             "panel_interpolation_mode": panel_mode_from_legacy(manifest.get("panel_interpolation_mode"), False),
+            "mapping_interpolation_domain": normalize_interpolation_domain(
+                manifest.get("mapping_interpolation_domain", DOMAIN_WELL_DATA_EXTENT)
+            ),
             "layer_mapping_scope": manifest.get("layer_mapping_scope", "Selected Layer"),
             "selected_reservoir_layer": manifest.get("selected_reservoir_layer"),
             "active_generated_layer": manifest.get("active_generated_layer"),

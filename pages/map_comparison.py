@@ -21,11 +21,15 @@ from core.plotting.map_builder import build_map_figure
 from core.scenarios import create_map_scenario
 from pages.shared import ensure_session_state, mark_project_dirty, project_display_name
 from utils.export import (
+    GEOTIFF_NODATA,
+    build_map_export_metadata,
     dataframe_to_csv_bytes,
     grid_to_dataframe,
     grid_to_excel_bytes,
-    grid_to_geotiff_bytes,
     grid_to_xyz_ascii_bytes,
+    map_base_filename,
+    map_geotiff_export_files,
+    map_zmap_export_files,
     metadata_to_json_bytes,
 )
 from utils.units import coordinate_unit_symbol
@@ -210,10 +214,34 @@ else:
                 "grid_y": result.grid_y,
                 "grid_z": result.grid_z,
                 "metadata": metadata,
+                "export_metadata": metadata,
                 "property": map_a.get("property"),
+                "property_col": "Pressure Change" if operation.startswith("Pressure Change") else f"Delta {map_a.get('property')}",
+                "property_type": "Pressure Change" if operation.startswith("Pressure Change") else "Delta",
                 "unit": map_a.get("property_unit") or "",
                 "coordinate_unit": map_a.get("coordinate_unit"),
                 "crs": map_a.get("crs", {}),
+                "x_col": map_a.get("x_col") or "X",
+                "y_col": map_a.get("y_col") or "Y",
+                "method": "Delta",
+                "method_parameters": {},
+                "grid_parameters": {"nx": result.grid_x.shape[1], "ny": result.grid_x.shape[0], "buffer_fraction": 0.0},
+                "mask_parameters": {"mode": "Delta overlap intersection"},
+                "mask_info": {
+                    "mask_mode": "Delta overlap intersection",
+                    "valid_grid_cells": int(np.isfinite(result.grid_z).sum()),
+                    "grid_cells_before_mask": int(result.grid_z.size),
+                },
+                "selected_panels": map_a.get("selected_panels", []),
+                "selected_layers": map_a.get("selected_layers", []),
+                "panel_interpolation_mode": map_a.get("panel_interpolation_mode", ""),
+                "reservoir_layer": map_a.get("reservoir_layer", ""),
+                "layer_mapping_scope": map_a.get("layer_mapping_scope", ""),
+                "is_pressure_map": False,
+                "included_observations": pd.DataFrame(),
+                "excluded_observations": pd.DataFrame(),
+                "engineering_controls": pd.DataFrame(),
+                "engineering_control_regions": [],
                 "title": result_title,
             }
             st.success("Delta map calculated.")
@@ -243,33 +271,62 @@ else:
         )
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
         st.caption(f"Grid alignment: {delta['metadata'].get('Grid_Alignment')}")
-        if str(delta["metadata"].get("Operation", "")).startswith("Pressure Change"):
+        if delta["metadata"].get("Operation") == "Later - Earlier":
             st.caption("Negative pressure change indicates pressure decline.")
 
+        project_metadata = dict(st.session_state.get("project_metadata", {}) or {})
+        delta_metadata = build_map_export_metadata(delta, project_metadata=project_metadata, nodata=GEOTIFF_NODATA)
+        base_name = map_base_filename(delta, project_metadata=project_metadata)
         grid_df = grid_to_dataframe(delta["grid_x"], delta["grid_y"], delta["grid_z"], "Delta", include_nan=False)
-        export_cols = st.columns(5)
-        export_cols[0].download_button("Delta CSV", dataframe_to_csv_bytes(grid_df), "delta_map.csv", "text/csv")
+        export_cols = st.columns(4)
+        export_cols[0].download_button("Delta CSV", dataframe_to_csv_bytes(grid_df), f"{base_name}.csv", "text/csv")
         export_cols[1].download_button(
             "Delta Excel",
-            grid_to_excel_bytes(grid_df, delta["metadata"]),
-            "delta_map.xlsx",
+            grid_to_excel_bytes(grid_df, delta_metadata),
+            f"{base_name}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        export_cols[2].download_button("Delta Metadata JSON", metadata_to_json_bytes(delta["metadata"]), "delta_metadata.json", "application/json")
-        export_cols[3].download_button("Delta XYZ ASCII", grid_to_xyz_ascii_bytes(grid_df), "delta_map.xyz", "text/plain")
-        crs = delta.get("crs", {}) or {}
-        if crs.get("mode") == "EPSG Code" and crs.get("epsg"):
-            try:
-                export_cols[4].download_button(
-                    "Delta GeoTIFF",
-                    grid_to_geotiff_bytes(delta["grid_x"], delta["grid_y"], delta["grid_z"], crs.get("epsg")),
-                    "delta_map.tif",
-                    "image/tiff",
+        export_cols[2].download_button("Delta Metadata JSON", metadata_to_json_bytes(delta_metadata), f"{base_name}_metadata.json", "application/json")
+        export_cols[3].download_button("Delta XYZ ASCII", grid_to_xyz_ascii_bytes(grid_df), f"{base_name}.xyz", "text/plain")
+
+        st.markdown("##### Delta GeoTIFF")
+        if delta_metadata.get("CRS_Mode") == "Local / Unknown XY":
+            st.info("CRS is undefined. The GeoTIFF preserves local XY geometry but has no EPSG spatial reference.")
+        try:
+            for filename, data, geotiff_metadata in map_geotiff_export_files(delta, project_metadata=project_metadata):
+                st.download_button(
+                    f"{geotiff_metadata.get('Property', 'Delta')} GeoTIFF",
+                    data,
+                    file_name=filename,
+                    mime="image/tiff",
+                    width="stretch",
                 )
-            except Exception as exc:
-                export_cols[4].caption(f"GeoTIFF unavailable: {exc}")
-        else:
-            export_cols[4].caption("GeoTIFF requires EPSG CRS.")
+        except Exception as exc:
+            st.warning(f"GeoTIFF export unavailable: {exc}")
+
+        st.markdown("##### Delta ZMAP Grid ASCII")
+        try:
+            for zmap_name, zmap_data, metadata_name, metadata_data, zmap_metadata in map_zmap_export_files(
+                delta,
+                project_metadata=project_metadata,
+            ):
+                zmap_cols = st.columns(2)
+                zmap_cols[0].download_button(
+                    f"{zmap_metadata.get('Property', 'Delta')} ZMAP",
+                    zmap_data,
+                    file_name=zmap_name,
+                    mime="text/plain",
+                    width="stretch",
+                )
+                zmap_cols[1].download_button(
+                    "Delta ZMAP Metadata JSON",
+                    metadata_data,
+                    file_name=metadata_name,
+                    mime="application/json",
+                    width="stretch",
+                )
+        except Exception as exc:
+            st.warning(f"ZMAP export unavailable: {exc}")
 
         scenario_name = st.text_input("Delta Scenario Name", value=f"Delta - {map_b.get('name')} minus {map_a.get('name')}")
         if st.button("Save Delta As Scenario"):
@@ -281,7 +338,7 @@ else:
                 "panel_grid": None,
                 "included_observations": pd.DataFrame(),
                 "excluded_observations": pd.DataFrame(),
-                "property_col": f"Delta {delta['property']}",
+                "property_col": delta.get("property_col", f"Delta {delta['property']}"),
                 "unit": delta["unit"],
                 "x_col": "X",
                 "y_col": "Y",
@@ -299,6 +356,13 @@ else:
                 "respect_compartments": False,
                 "geometry_context": {},
                 "duplicate_method": "",
+                "crs": delta.get("crs", {}),
+                "selected_panels": delta.get("selected_panels", []),
+                "selected_layers": delta.get("selected_layers", []),
+                "panel_interpolation_mode": delta.get("panel_interpolation_mode", ""),
+                "reservoir_layer": delta.get("reservoir_layer", ""),
+                "layer_mapping_scope": delta.get("layer_mapping_scope", ""),
+                "property_type": delta.get("property_type", "Delta"),
                 "hover_columns": [],
                 "title": delta["title"],
                 "export_metadata": delta["metadata"],

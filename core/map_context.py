@@ -7,7 +7,9 @@ from datetime import date
 import numpy as np
 
 from core.active_data import panel_mode_from_legacy
+from core.crs import normalize_crs_config
 from core.pressure_dates import format_map_date
+from utils.constants import APP_NAME
 from utils.units import coordinate_unit_symbol
 
 
@@ -65,15 +67,22 @@ def build_map_metadata(
     control_region_ids: list[object] | tuple[object, ...] | None = None,
 ) -> dict[str, object]:
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
+    crs_config = normalize_crs_config(crs)
     metadata: dict[str, object] = {
+        "Application": APP_NAME,
         "Property": property_name,
         "Property_Type": property_type or ("Pressure" if is_pressure_map else "Generic"),
         "Property_Unit": property_unit or "",
         "X_Column": x_column,
         "Y_Column": y_column,
+        "X_Field": x_column,
+        "Y_Field": y_column,
         "Coordinate_Unit": unit_symbol,
-        "CRS_Mode": (crs or {}).get("mode", ""),
-        "CRS_EPSG": (crs or {}).get("epsg", ""),
+        "CRS_Mode": crs_config.get("mode", ""),
+        "CRS_EPSG": crs_config.get("epsg", ""),
+        "EPSG": crs_config.get("epsg", ""),
+        "CRS_Name": crs_config.get("name", ""),
+        "CRS_Authority": crs_config.get("authority", ""),
         "Interpolation_Method": interpolation_method,
         "Grid_NX": grid_parameters.get("nx"),
         "Grid_NY": grid_parameters.get("ny"),
@@ -81,6 +90,7 @@ def build_map_metadata(
         "Duplicate_Coordinate_Handling": duplicate_method,
         "Mask": mask_parameters.get("mode"),
         "Interpolation_Domain": interpolation_domain or grid_parameters.get("interpolation_domain", ""),
+        "Interpolation_Domain_Type": interpolation_domain or grid_parameters.get("interpolation_domain", ""),
         "Panel_Interpolation_Mode": panel_mode_from_legacy(panel_interpolation_mode, False),
         "Selected_Panels": ", ".join(str(value) for value in (selected_panels or [])),
         "Selected_Layers": ", ".join(str(value) for value in (selected_layers or [])),
@@ -104,14 +114,56 @@ def build_map_metadata(
         metadata["Domain_Min_Y"] = float(domain_bounds[1])
         metadata["Domain_Max_X"] = float(domain_bounds[2])
         metadata["Domain_Max_Y"] = float(domain_bounds[3])
+        metadata["Domain_Bounds"] = {
+            "min_x": float(domain_bounds[0]),
+            "min_y": float(domain_bounds[1]),
+            "max_x": float(domain_bounds[2]),
+            "max_y": float(domain_bounds[3]),
+        }
+    domain_type = str(metadata.get("Interpolation_Domain_Type") or "")
+    if domain_type == "Reservoir Boundary Extent":
+        metadata["Domain_Geometry_Source"] = "Reservoir Boundary"
+    elif domain_type in {"Selected Panel Union Extent", "Selected Panel Extent"}:
+        metadata["Domain_Geometry_Source"] = "Selected Panel Union"
+    elif domain_type:
+        metadata["Domain_Geometry_Source"] = "Well Data"
     if grid_x is not None and grid_y is not None:
         x = np.asarray(grid_x, dtype=float)
         y = np.asarray(grid_y, dtype=float)
         if x.ndim == 2 and y.ndim == 2 and x.shape[1] > 1 and y.shape[0] > 1:
-            metadata["Grid_DX_Value"] = float(np.nanmedian(np.diff(x[0, :])))
+            dx = float(np.nanmedian(np.diff(x[0, :])))
+            dy = float(np.nanmedian(np.diff(y[:, 0])))
+            abs_dx = abs(dx)
+            abs_dy = abs(dy)
+            metadata["Grid_NX"] = int(x.shape[1])
+            metadata["Grid_NY"] = int(x.shape[0])
+            metadata["NX"] = int(x.shape[1])
+            metadata["NY"] = int(x.shape[0])
+            metadata["Grid_DX_Value"] = dx
             metadata["Grid_DX_Unit"] = unit_symbol
-            metadata["Grid_DY_Value"] = float(np.nanmedian(np.diff(y[:, 0])))
+            metadata["Grid_DY_Value"] = dy
             metadata["Grid_DY_Unit"] = unit_symbol
+            metadata["X_Spacing"] = abs_dx
+            metadata["Y_Spacing"] = abs_dy
+            metadata["X_Spacing_Unit"] = unit_symbol
+            metadata["Y_Spacing_Unit"] = unit_symbol
+            metadata["Grid_X_Min"] = float(np.nanmin(x))
+            metadata["Grid_X_Max"] = float(np.nanmax(x))
+            metadata["Grid_Y_Min"] = float(np.nanmin(y))
+            metadata["Grid_Y_Max"] = float(np.nanmax(y))
+            metadata["Bounds"] = {
+                "x_min_center": float(np.nanmin(x)),
+                "x_max_center": float(np.nanmax(x)),
+                "y_min_center": float(np.nanmin(y)),
+                "y_max_center": float(np.nanmax(y)),
+                "west_edge": float(np.nanmin(x)) - abs_dx / 2.0,
+                "east_edge": float(np.nanmax(x)) + abs_dx / 2.0,
+                "south_edge": float(np.nanmin(y)) - abs_dy / 2.0,
+                "north_edge": float(np.nanmax(y)) + abs_dy / 2.0,
+            }
+            metadata["Grid_Node_Convention"] = (
+                "Grid X/Y arrays are cell centers; raster edge bounds are one half spacing outside the center limits."
+            )
 
     geometry_context = geometry_context or {}
     if geometry_context:

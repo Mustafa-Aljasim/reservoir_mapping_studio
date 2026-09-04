@@ -55,7 +55,7 @@ The archive stores:
 - geometry layers
 - interpolation settings
 - engineering control points and soft control regions
-- selected Reservoir Layer scope and generated layer maps
+- selected Reservoir Layer scope, selected panels, panel interpolation mode, interpolation domain, and generated layer maps
 - variogram settings
 - saved map scenarios
 - CRS metadata
@@ -68,7 +68,13 @@ Use the Map Library to save, rename, duplicate, delete, and reopen map scenarios
 
 ## Reservoir Layers
 
-Reservoir Layer is an explicit mapping dimension, separate from metadata filters. A source column named `Zone` can still be mapped as `Layer`, but `Zone` is not a first-class semantic field in V1.
+Reservoir Layer is an explicit vertical mapping dimension, separate from metadata filters and separate from lateral panel geometry. A source column named `Zone` can still be mapped as `Layer`, but `Zone` is not a first-class semantic field in V1.
+
+The PASS 4.1 model keeps three concepts separate:
+
+- Reservoir Layer: vertical/correlative reservoir subdivision that controls selected-layer or all-layer map outputs.
+- Panel: lateral grouping or compartment context, usually from a mapped data `Panel` column and/or imported panel polygons.
+- Geometry Role: the spatial purpose of imported geometry, such as Reservoir Boundary, Panel / Compartment, Fault, or Reference / Custom Geometry.
 
 Mapping Studio supports:
 
@@ -77,7 +83,7 @@ Mapping Studio supports:
 - Layer map switching: switch among generated layer maps without recomputing interpolation.
 - Map status: generated maps show whether computational inputs are up to date or stale.
 
-Panel selection is applied before layer splitting. In combined panel mode, each layer map pools observations from the selected panels. In independent panel mode, each layer map respects panel/compartment boundaries.
+Reservoir-layer availability is derived from the active tabular data after ordinary filters, pressure reference date selection, and mapped data-panel selection when a `Panel` column exists. It is not inferred from polygon geometry alone, so loading or selecting panel polygons does not hide valid Reservoir Layer values. In combined panel mode, each layer map pools observations from the selected panels. In independent panel mode, each Reservoir Layer still produces one map, but interpolation is performed separately inside each selected panel/compartment.
 
 ## Engineering Controls
 
@@ -128,9 +134,12 @@ Negative values indicate pressure decline.
 Project-level CRS support is optional and non-blocking. Supported modes are:
 
 - Local / Unknown XY
-- EPSG Code
+- EPSG:32638 - WGS 84 / UTM zone 38N
+- Custom EPSG
 
-The application validates EPSG values with `pyproj`, stores the resolved CRS metadata, and uses it for project/map compatibility checks and export metadata.
+The application validates Custom EPSG values with `pyproj`, stores the resolved CRS metadata, and uses it for project/map compatibility checks and export metadata.
+
+V1 does not transform or reproject coordinates. The configured CRS means: the supplied X/Y coordinates are interpreted in this CRS. EPSG:32638 is a projected CRS defined in meters; if the project coordinate unit is not meters, the app warns the user but does not convert any values.
 
 ## Units and Pressure Semantics
 
@@ -152,6 +161,13 @@ The application supports:
 - custom geometry layers
 - maximum-distance and convex-hull mask combinations
 
+Spatial Domain and Spatial Mask are separate controls:
+
+- Interpolation Domain controls the rectangular grid extent used for interpolation: Well Data Extent, Reservoir Boundary Extent, or Selected Panel Union Extent.
+- Spatial Mask controls which interpolated grid cells remain valid after interpolation: no mask, reservoir boundary, selected panel union, maximum distance, convex hull, or supported combinations.
+- Selected Panel Union Extent uses the union bounds of selected panel polygons. In combined mode, there is no artificial internal panel gap across shared panel boundaries.
+- Independent by Panel / Compartment uses the same Reservoir Layer output model, but computes each selected panel from its own assigned observations and stores the compartment grid for traceability.
+
 ## Interpolation and Kriging
 
 Supported methods include:
@@ -172,8 +188,9 @@ The app supports:
 - separate engineering-control CSV and Excel exports
 - map image exports in PNG, SVG, and PDF
 - XYZ ASCII export
+- ZMAP Grid ASCII export
 - metadata JSON export
-- GeoTIFF export when a valid EPSG CRS is present
+- GeoTIFF export with embedded EPSG CRS when known, or local XY geometry with no CRS when unknown
 
 ## Sample Data
 
@@ -210,7 +227,7 @@ This V1 is intentionally focused and not a full GIS or reservoir modeling platfo
 
 ## Optional Features Policy
 
-Secondary features such as ZMAP, GeoTIFF, and PDF export remain supported only when they are stable and reliable. Core engineering flow remains the priority: project persistence, saved maps, comparison, delta maps, and export quality.
+Secondary features such as ZMAP, GeoTIFF, and PDF export are wired through the shared V1 export helpers so grid orientation, CRS metadata, NoData, and scenario snapshots remain consistent. Core engineering flow remains the priority: project persistence, saved maps, comparison, delta maps, and export quality.
 
 - Observed vs Predicted scatter with a 1:1 reference line
 - Residual histogram
@@ -230,13 +247,41 @@ Interpolated grid exports include:
 
 - X
 - Y
-- Property value for deterministic methods
+- Value for deterministic methods
 - Estimated_Value for kriging outputs
 - Kriging_Variance where available
 - Kriging_StdDev where available
 - Panel where panel-constrained interpolation is active
 
-Excel grid export includes a `Map_Metadata` sheet with property, units, grid setup, duplicate handling, mask method, Reservoir Layer scope, geometry context, custom layer count, kriging parameters, anisotropy settings, and distance/range units.
+Excel grid export includes `Interpolated_Grid` and `Map_Metadata` sheets. When applicable, it also includes `Engineering_Controls`, `Control_Regions`, and `Validation` sheets. Engineering controls are exported separately from measured observations with control ID, source type, region ID, X/Y, property, value, unit, Reservoir Layer, panel, pressure reference date, active status, and comment.
+
+Export metadata records the domain/mask split with `Interpolation_Domain_Type`, `Domain_Bounds`, `Domain_Geometry_Source`, `Mask`, selected panels, selected Reservoir Layer, panel interpolation mode, CRS, grid dimensions, and NoData value. Saved scenarios snapshot this metadata so reopening a project or map does not change the export definition.
+
+### GeoTIFF
+
+GeoTIFF export writes the generated MapResult grid exactly; it does not regenerate interpolation. Grid X/Y arrays are treated as cell centers. The affine transform uses west and north edge coordinates calculated one half grid spacing outside the center limits. Raster rows are written north-to-south and columns west-to-east, matching north-up GIS raster convention while preserving the app's south-to-north NumPy meshgrid order.
+
+Known EPSG CRS settings are embedded in the raster. Local / Unknown XY exports are allowed; those rasters preserve local Cartesian coordinates, pixel size, bounds, NoData, and masks, but contain no EPSG spatial reference. Masked and invalid cells are written as GeoTIFF NoData (`-9999.0`). Reservoir boundary masks, panel masks, maximum-distance masks, Linear/Cubic NaNs, internal NaNs, and delta-map non-overlap are preserved.
+
+All-layer export writes one GeoTIFF per generated Reservoir Layer, not one multi-band raster. Ordinary Kriging exports include estimate, kriging variance, and kriging standard deviation rasters with identical transform, CRS, bounds, and dimensions.
+
+### ZMAP Grid ASCII
+
+Reservoir Mapping Studio V1 writes a documented ZMAP-style gridded ASCII dialect:
+
+- comment lines start with `!` and include Reservoir Mapping Studio metadata
+- core header starts with `@GRID FILE, GRID, 4`
+- format line is `values_per_line, null_value, , decimal_places, 1`
+- geometry line is `NX, NY, X_MIN, X_MAX, Y_MIN, Y_MAX`
+- rotation/origin line is `0.0, 0.0, 0.0`
+- a single `@` line precedes grid values
+- X/Y header min/max are grid cell-center limits
+- grid spacing is `(X_MAX - X_MIN) / (NX - 1)` and `(Y_MAX - Y_MIN) / (NY - 1)`
+- null value is `-999.25`
+- numeric values use fixed decimal formatting with 6 decimal places
+- grid values are written north-to-south by row and west-to-east by column
+
+ZMAP exports preserve projected or local Cartesian X/Y values exactly. EPSG:32638 and Custom EPSG settings are recorded in comments and companion metadata JSON; Local / Unknown XY records the coordinate unit and unknown CRS state. All-layer export writes one ZMAP file per generated Reservoir Layer. This is described as ZMAP Grid ASCII / RMS V1 ZMAP-style gridded ASCII; no Petrel compatibility claim is made without external import validation.
 
 Cross-validation results can be downloaded as CSV or Excel from the Geostatistics Lab.
 
@@ -261,10 +306,10 @@ python -m compileall .
 python -m pytest -q
 ```
 
-The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, stale map signatures, engineering control scoping/conditioning/persistence, pressure-change guards, and project persistence.
+The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, PASS 4.1 spatial domain decoupling, stale map signatures, engineering control scoping/conditioning/persistence, pressure-change guards, CRS round trips, GeoTIFF and ZMAP round trips, and project persistence.
 
 ## Current Limitations
 
-This level does not implement Universal Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, mathematical barrier Kriging, CRS transformations, 3D geostatistics, GeoTIFF expansion beyond the existing EPSG-gated grid export, Petrel/ZMAP export, database connections, pressure datum-depth correction, or temporal pressure extrapolation.
+This level does not implement CRS reprojection/transformation, barrier/fault Kriging, Universal Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, 3D mapping, corner-point grids, interactive GIS vertex editing, database backend/authentication, pressure datum-depth correction, or temporal pressure extrapolation.
 
-Static map image export is still left to the Plotly mode bar/browser workflow rather than a dedicated server-side image export dependency.
+Static PNG, SVG, and PDF image export uses Plotly/Kaleido. If Kaleido is missing or unavailable, the app shows an export failure message instead of crashing.

@@ -17,6 +17,7 @@ from core.active_data import (
     respect_compartments_from_mode,
     signatures_match,
 )
+from core.crs import normalize_crs_config
 from core.data_qc import prepare_interpolation_dataframe
 from core.engineering_controls import engineering_controls_for_context
 from core.geometry.compartment import (
@@ -52,6 +53,15 @@ LAYER_MAPPING_SCOPES = (LAYER_SCOPE_SELECTED, LAYER_SCOPE_ALL)
 UNSPECIFIED_LAYER = "Unspecified"
 MAP_STATUS_UP_TO_DATE = "Up to date"
 MAP_STATUS_STALE = "Parameters changed - update required"
+DOMAIN_WELL_DATA_EXTENT = "Well Data Extent"
+DOMAIN_RESERVOIR_BOUNDARY_EXTENT = "Reservoir Boundary Extent"
+DOMAIN_SELECTED_PANEL_UNION_EXTENT = "Selected Panel Union Extent"
+LEGACY_DOMAIN_SELECTED_PANEL_EXTENT = "Selected Panel Extent"
+INTERPOLATION_DOMAIN_OPTIONS = (
+    DOMAIN_WELL_DATA_EXTENT,
+    DOMAIN_RESERVOIR_BOUNDARY_EXTENT,
+    DOMAIN_SELECTED_PANEL_UNION_EXTENT,
+)
 
 
 @dataclass(frozen=True)
@@ -193,13 +203,58 @@ def resolve_domain_bounds(
     panel_layer: GeometryLayer | None = None,
     selected_panels: list[object] | tuple[object, ...] | None = None,
 ) -> tuple[float, float, float, float] | None:
-    if interpolation_domain == "Reservoir Boundary Extent" and reservoir_boundary_layer:
+    if interpolation_domain == DOMAIN_RESERVOIR_BOUNDARY_EXTENT and reservoir_boundary_layer:
         reservoir_geometry = polygon_union(reservoir_boundary_layer.polygon_features)
         if reservoir_geometry is not None and not reservoir_geometry.is_empty:
             return tuple(float(value) for value in reservoir_geometry.bounds)
-    if interpolation_domain == "Selected Panel Extent":
+    if interpolation_domain in {DOMAIN_SELECTED_PANEL_UNION_EXTENT, LEGACY_DOMAIN_SELECTED_PANEL_EXTENT}:
         return selected_panel_bounds(panel_layer, selected_panels)
     return None
+
+
+def normalize_interpolation_domain(interpolation_domain: str | None) -> str:
+    if interpolation_domain == LEGACY_DOMAIN_SELECTED_PANEL_EXTENT:
+        return DOMAIN_SELECTED_PANEL_UNION_EXTENT
+    if interpolation_domain in {
+        DOMAIN_WELL_DATA_EXTENT,
+        DOMAIN_RESERVOIR_BOUNDARY_EXTENT,
+        DOMAIN_SELECTED_PANEL_UNION_EXTENT,
+    }:
+        return str(interpolation_domain)
+    return DOMAIN_WELL_DATA_EXTENT
+
+
+def interpolation_domain_options(
+    *,
+    has_reservoir_boundary: bool = False,
+    has_selected_panel_union: bool = False,
+) -> list[str]:
+    options = [DOMAIN_WELL_DATA_EXTENT]
+    if has_reservoir_boundary:
+        options.append(DOMAIN_RESERVOIR_BOUNDARY_EXTENT)
+    if has_selected_panel_union:
+        options.append(DOMAIN_SELECTED_PANEL_UNION_EXTENT)
+    return options
+
+
+def coerce_interpolation_domain_selection(
+    interpolation_domain: str | None,
+    options: list[str] | tuple[str, ...],
+) -> str:
+    valid_options = [option for option in options if option in INTERPOLATION_DOMAIN_OPTIONS]
+    if not valid_options:
+        return DOMAIN_WELL_DATA_EXTENT
+    normalized = normalize_interpolation_domain(interpolation_domain)
+    return normalized if normalized in valid_options else valid_options[0]
+
+
+def domain_geometry_source(interpolation_domain: str | None) -> str:
+    domain = normalize_interpolation_domain(interpolation_domain)
+    if domain == DOMAIN_RESERVOIR_BOUNDARY_EXTENT:
+        return "Reservoir Boundary"
+    if domain == DOMAIN_SELECTED_PANEL_UNION_EXTENT:
+        return "Selected Panel Union"
+    return "Well Data"
 
 
 def _apply_masks(
@@ -219,15 +274,15 @@ def _apply_masks(
     masks: list[np.ndarray] = []
     if "Reservoir Boundary" in mode and reservoir_boundary_layer is not None:
         masks.append(layer_keep_mask(reservoir_boundary_layer, grid_x, grid_y))
+    selected_panel_mask = "Selected Panel Union" in mode and panel_layer is not None and selected_panels
+    if selected_panel_mask:
+        masks.append(panel_domain_keep_mask(panel_layer, selected_panels, grid_x, grid_y))
     if "Convex Hull" in mode:
         masks.append(convex_hull_keep_mask(prepared["X"], prepared["Y"], grid_x, grid_y))
     if "Maximum Distance" in mode:
         if max_distance_value is None:
             max_distance_value = auto_maximum_distance(prepared["X"], prepared["Y"])
         masks.append(maximum_distance_keep_mask(prepared["X"], prepared["Y"], grid_x, grid_y, float(max_distance_value)))
-    if apply_panel_domain and panel_layer is not None and selected_panels:
-        masks.append(panel_domain_keep_mask(panel_layer, selected_panels, grid_x, grid_y))
-
     keep_mask = combine_masks(*masks) if masks else np.ones_like(grid_z, dtype=bool)
     masked_z = apply_keep_mask(grid_z, keep_mask)
     masked_variance = apply_keep_mask(grid_variance, keep_mask) if grid_variance is not None else None
@@ -238,8 +293,8 @@ def _apply_masks(
         "valid_grid_cells": int(np.isfinite(masked_z).sum()),
         "finite_grid_cells_before_mask": int(np.isfinite(grid_z).sum()),
         "grid_cells_before_mask": int(grid_z.size),
-        "panel_domain_masked_cells": int((~masks[-1]).sum())
-        if apply_panel_domain and panel_layer is not None and selected_panels and masks
+        "panel_domain_masked_cells": int((~panel_domain_keep_mask(panel_layer, selected_panels, grid_x, grid_y)).sum())
+        if selected_panel_mask
         else 0,
     }
 
@@ -458,6 +513,7 @@ def generate_single_layer_map(
     well_col: str | None = None,
     hover_columns: list[tuple[str, str]] | None = None,
 ) -> dict[str, object]:
+    interpolation_domain = normalize_interpolation_domain(interpolation_domain)
     domain_bounds = resolve_domain_bounds(interpolation_domain, reservoir_boundary_layer, panel_layer, selected_panels)
     filtered_with_include, prepared = prepare_layer_observations(
         dataframe=dataframe,
@@ -619,6 +675,15 @@ def generate_single_layer_map(
         else [],
         control_region_ids=[region.get("Region_ID") for region in control_selection.regions],
     )
+    export_metadata["Interpolation_Domain_Type"] = interpolation_domain
+    export_metadata["Domain_Geometry_Source"] = domain_geometry_source(interpolation_domain)
+    if domain_bounds is not None:
+        export_metadata["Domain_Bounds"] = {
+            "min_x": float(domain_bounds[0]),
+            "min_y": float(domain_bounds[1]),
+            "max_x": float(domain_bounds[2]),
+            "max_y": float(domain_bounds[3]),
+        }
     title = build_default_map_title(
         property_column,
         filter_values_no_layer,
@@ -672,6 +737,7 @@ def generate_single_layer_map(
         "y_col": y_col,
         "well_col": well_col,
         "coordinate_unit": coordinate_unit,
+        "crs": normalize_crs_config(crs),
         "is_pressure_map": is_pressure_map,
         "property_type": property_type,
         "map_reference_date": pressure_reference_date,
@@ -785,6 +851,7 @@ def generate_layer_map_collection(
     scope = normalize_layer_scope(layer_scope)
     filter_values_no_layer = filter_values_excluding_semantics(mappings, filter_values, ("layer",))
     if layer_column(mappings):
+        panel_selection_for_layers = selected_panels if panel_layer is not None and mappings.get("panel") else None
         active_for_layers = prepare_active_property_data(
             dataframe,
             mappings,
@@ -792,16 +859,8 @@ def generate_layer_map_collection(
             property_type,
             pressure_reference_date,
             filter_values_no_layer,
-            selected_panels if panel_layer is not None else None,
+            panel_selection_for_layers,
         ).dataframe
-        if selected_panels and panel_layer is not None and not mappings.get("panel"):
-            active_for_layers = filter_dataframe_to_selected_panels(
-                active_for_layers,
-                x_col,
-                y_col,
-                panel_layer,
-                selected_panels,
-            )
         available_layers = reservoir_layer_values(active_for_layers, mappings)
     else:
         available_layers = []

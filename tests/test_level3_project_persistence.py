@@ -180,7 +180,8 @@ def test_delta_map_and_pressure_change_are_correct():
     assert np.allclose(pressure_change.grid_z, -200.0)
     assert pressure_change.metadata["Date_A"] == "2025-01-01"
     assert pressure_change.metadata["Date_B"] == "2026-01-01"
-    assert pressure_change.metadata["Operation"] == "Pressure Change 01-Jan-2026 minus 01-Jan-2025"
+    assert pressure_change.metadata["Operation"] == "Later - Earlier"
+    assert pressure_change.metadata["Operation_Label"] == "Pressure Change 01-Jan-2026 minus 01-Jan-2025"
     assert pressure_change.metadata["Delta_P_Convention"] == "Later pressure map minus earlier pressure map."
 
 

@@ -13,6 +13,7 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
 from core.active_data import panel_mode_from_legacy
+from core.crs import normalize_crs_config
 from core.engineering_controls import (
     deserialize_control_points,
     deserialize_control_regions,
@@ -140,7 +141,7 @@ def create_map_scenario(
         "include_state": json_safe((project_context or {}).get("include_state", {})),
         "included_observation_ids": _observation_ids(included_observations),
         "excluded_observation_ids": _observation_ids(excluded_observations),
-        "crs": json_safe((project_context or {}).get("crs", {})),
+        "crs": json_safe(normalize_crs_config(generated_map.get("crs") or (project_context or {}).get("crs", {}))),
         "export_metadata": json_safe(generated_map.get("export_metadata", {})),
         "measured_observation_count": int(generated_map.get("measured_observation_count", len(included_observations))),
         "conditioning_observation_count": int(
@@ -194,6 +195,7 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "y_col": scenario.get("y_col"),
         "well_col": scenario.get("well_col"),
         "coordinate_unit": scenario.get("coordinate_unit"),
+        "crs": deepcopy(scenario.get("crs", {})),
         "is_pressure_map": bool(scenario.get("is_pressure_map", False)),
         "map_reference_date": scenario.get("pressure_reference_date"),
         "measurement_date_col": scenario.get("measurement_date_col"),

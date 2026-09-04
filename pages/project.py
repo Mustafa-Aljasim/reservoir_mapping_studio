@@ -4,10 +4,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
-from core.crs import EPSG_CRS_MODE, LOCAL_CRS_MODE, crs_display_name, local_crs, validate_epsg
+from core.crs import (
+    CRS_MODE_OPTIONS,
+    CUSTOM_EPSG_CRS_MODE,
+    EPSG_32638,
+    EPSG_32638_CRS_MODE,
+    LOCAL_CRS_MODE,
+    crs_coordinate_unit_warning,
+    crs_display_name,
+    local_crs,
+    normalize_crs_config,
+    preset_crs_32638,
+    validate_epsg,
+)
 from core.project_io import ProjectArchiveError, load_project_archive, save_project_archive
 from core.scenarios import duplicate_scenario, rename_scenario, scenario_summary_table, scenario_to_generated_map
 from pages.shared import (
@@ -35,7 +46,10 @@ def _session_snapshot() -> dict[str, object]:
         "coordinate_unit",
         "property_unit",
         "pressure_reference_date",
+        "selected_panels",
+        "panel_interpolation_mode",
         "layer_mapping_scope",
+        "mapping_interpolation_domain",
         "selected_reservoir_layer",
         "active_generated_layer",
         "generated_layer_maps",
@@ -151,28 +165,46 @@ with project_tab:
 
 with crs_tab:
     st.markdown("#### Coordinate Reference System")
-    current_crs = dict(st.session_state.get("crs", local_crs().to_dict()))
+    current_crs = normalize_crs_config(st.session_state.get("crs", local_crs().to_dict()))
+    current_mode = str(current_crs.get("mode") or LOCAL_CRS_MODE)
+    if int(current_crs.get("epsg") or 0) == EPSG_32638:
+        current_mode = EPSG_32638_CRS_MODE
+    elif current_mode not in CRS_MODE_OPTIONS:
+        current_mode = CUSTOM_EPSG_CRS_MODE if current_crs.get("epsg") else LOCAL_CRS_MODE
     mode = st.radio(
         "CRS Mode",
-        [LOCAL_CRS_MODE, EPSG_CRS_MODE],
-        index=1 if current_crs.get("mode") == EPSG_CRS_MODE else 0,
+        CRS_MODE_OPTIONS,
+        index=CRS_MODE_OPTIONS.index(current_mode),
         horizontal=True,
     )
+    pending_crs = None
     if mode == LOCAL_CRS_MODE:
-        st.session_state.crs = local_crs().to_dict()
+        pending_crs = local_crs().to_dict()
         st.caption("Local / Unknown XY remains fully supported. CRS is stored as project metadata only.")
+        st.caption("The supplied X/Y coordinates are interpreted as local Cartesian coordinates.")
+    elif mode == EPSG_32638_CRS_MODE:
+        pending_crs = preset_crs_32638().to_dict()
+        st.success("EPSG:32638 - WGS 84 / UTM zone 38N")
+        st.caption("Coordinate Unit: Meters (m). Coordinates are interpreted in this CRS and are not transformed.")
+        unit_warning = crs_coordinate_unit_warning(pending_crs, st.session_state.get("coordinate_unit"))
+        if unit_warning:
+            st.warning(unit_warning)
     else:
         default_epsg = int(current_crs.get("epsg") or 32638)
         epsg = st.number_input("EPSG Code", min_value=1, max_value=999999, value=default_epsg, step=1)
         try:
-            resolved = validate_epsg(epsg)
-            st.session_state.crs = resolved.to_dict()
-            st.success(crs_display_name(st.session_state.crs))
+            pending_crs = validate_epsg(epsg).to_dict()
+            st.success(crs_display_name(pending_crs))
+            st.caption("The supplied X/Y coordinates are interpreted in this CRS and are not transformed in V1.")
         except ValueError as exc:
             st.error(str(exc))
     if st.button("Update CRS"):
-        mark_project_dirty()
-        st.success("CRS settings updated.")
+        if pending_crs is None:
+            st.error("Resolve a valid CRS before updating the project.")
+        else:
+            st.session_state.crs = pending_crs
+            mark_project_dirty()
+            st.success("CRS settings updated.")
 
 with library_tab:
     st.markdown("#### Saved Maps")

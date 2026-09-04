@@ -125,6 +125,7 @@ filter_values_no_layer = filter_values_excluding_semantics(
 )
 layer_col = layer_column(mappings)
 has_layer_column = bool(layer_col and layer_col in df.columns)
+panel_selection_for_layers = selected_panels if panel_layer is not None and mappings.get("panel") else None
 active_for_layers = prepare_active_property_data(
     df,
     mappings,
@@ -132,10 +133,8 @@ active_for_layers = prepare_active_property_data(
     property_type,
     pressure_reference_date,
     filter_values_no_layer,
-    selected_panels if panel_layer is not None else None,
+    panel_selection_for_layers,
 ).dataframe
-if selected_panels and panel_layer is not None and not mappings.get("panel"):
-    active_for_layers = filter_dataframe_to_selected_panels(active_for_layers, x_col, y_col, panel_layer, selected_panels)
 layer_options = reservoir_layer_values(active_for_layers, mappings) if has_layer_column else []
 selected_layer = None
 if has_layer_column:

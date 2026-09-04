@@ -155,6 +155,16 @@ def prepare_active_property_data(
 
     resolved_property_type = normalize_property_type(property_column, property_type)
     filtered = apply_filters(dataframe, mappings, filter_values or {})
+    resolved_reference_date = None
+    if resolved_property_type == PROPERTY_TYPE_PRESSURE:
+        resolved_reference_date = resolve_pressure_reference_date(filtered, mappings, pressure_reference_date)
+        filtered = filter_pressure_reference_date(
+            filtered,
+            mappings,
+            resolved_property_type,
+            resolved_reference_date,
+        )
+
     panel_selection_supplied = selected_panels is not None
     selected_panel_tuple = tuple(str(value) for value in (selected_panels or ()) if value not in (None, ""))
     if panel_selection_supplied and not selected_panel_tuple:
@@ -167,16 +177,6 @@ def prepare_active_property_data(
         filtered = filtered.iloc[0:0].copy()
     elif selected_layer_tuple:
         filtered = _filter_selected_layer_column(filtered, mappings, selected_layer_tuple)
-
-    resolved_reference_date = None
-    if resolved_property_type == PROPERTY_TYPE_PRESSURE:
-        resolved_reference_date = resolve_pressure_reference_date(filtered, mappings, pressure_reference_date)
-        filtered = filter_pressure_reference_date(
-            filtered,
-            mappings,
-            resolved_property_type,
-            resolved_reference_date,
-        )
 
     return ActivePropertyData(
         dataframe=filtered.reset_index(drop=True),

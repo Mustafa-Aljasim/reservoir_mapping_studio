@@ -8,7 +8,7 @@ from datetime import date
 import numpy as np
 from scipy.interpolate import griddata
 
-from core.crs import crs_are_compatible
+from core.crs import crs_are_compatible, normalize_crs_config
 from core.pressure_dates import format_map_date
 
 
@@ -165,12 +165,19 @@ def calculate_delta(
         raise ValueError("Delta map has no overlapping valid support after grid alignment and mask intersection.")
     delta = np.full_like(a_z, np.nan, dtype=float)
     delta[valid_delta] = b_z[valid_delta] - a_z[valid_delta]
+    crs = normalize_crs_config(map_a.get("crs", {}))
+    operation_code = "B - A" if str(operation).strip() in {"Map B - Map A", "B - A"} else str(operation)
     metadata = {
         "Source_Map_A": map_a.get("name"),
         "Source_Map_B": map_b.get("name"),
-        "Operation": operation,
+        "Operation": operation_code,
+        "Operation_Label": operation,
         "Property": map_a.get("property"),
         "Property_Unit": map_a.get("property_unit") or "",
+        "Coordinate_Unit": map_a.get("coordinate_unit") or "",
+        "CRS_Mode": crs.get("mode", ""),
+        "CRS_EPSG": crs.get("epsg", ""),
+        "CRS_Name": crs.get("name", ""),
         "Date_A": map_a.get("pressure_reference_date") or "",
         "Date_B": map_b.get("pressure_reference_date") or "",
         "Grid_Alignment": alignment,
@@ -241,8 +248,14 @@ def calculate_pressure_change(first: dict[str, object], second: dict[str, object
     result.metadata["Source_Map_Later"] = later.get("name")
     result.metadata["Date_Earlier"] = earlier_date
     result.metadata["Date_Later"] = later_date
+    result.metadata["Earlier_Reference_Date"] = earlier_date
+    result.metadata["Later_Reference_Date"] = later_date
+    result.metadata["Operation"] = "Later - Earlier"
+    result.metadata["Operation_Label"] = label
     result.metadata["Pressure_Change_Label"] = label
     result.metadata["Delta_P_Convention"] = "Later pressure map minus earlier pressure map."
+    result.metadata["Negative_Values"] = "Pressure decline"
+    result.metadata["Positive_Values"] = "Pressure increase"
     return result
 
 

@@ -297,13 +297,13 @@ with geometry_tab:
     summary_cols[0].metric("Reservoir Boundary", "Loaded" if boundary_layer else "Not loaded")
     summary_cols[1].metric("Panels", 0 if panel_layer is None else panel_layer.feature_count)
     summary_cols[2].metric("Faults", 0 if fault_layer is None else fault_layer.feature_count)
-    summary_cols[3].metric("Custom Layers", len(custom_layers))
+    summary_cols[3].metric("Reference Geometry", len(custom_layers))
     summary_cols[4].metric("Coordinate Unit", coordinate_unit_symbol(coordinate_unit))
 
     for label, key in [
-        ("Reservoir Boundary", "reservoir_boundary"),
-        ("Panel / Compartment", "panels"),
-        ("Fault", "faults"),
+        ("Reservoir Outer Boundary", "reservoir_boundary"),
+        ("Panel / Compartment Polygons", "panels"),
+        ("Fault Lines", "faults"),
     ]:
         layer = geometry_layers.get(key)
         if layer:
@@ -315,10 +315,10 @@ with geometry_tab:
 
     for index, layer in enumerate(list(custom_layers)):
         st.write(
-            f"Custom Layer - {layer.name}: {layer.feature_count} feature(s), "
+            f"Reference / Custom Geometry - {layer.name}: {layer.feature_count} feature(s), "
             f"total polygon area {format_area(layer_total_area(layer), coordinate_unit)}"
         )
-        if st.button(f"Remove Custom Layer {layer.name}", key=f"remove_custom_{index}"):
+        if st.button(f"Remove Reference Geometry {layer.name}", key=f"remove_custom_{index}"):
             custom_layers.pop(index)
             geometry_layers["custom"] = custom_layers
             st.session_state.generated_map = None
@@ -329,12 +329,19 @@ with geometry_tab:
         type=["geojson", "json", "csv", "zip"],
         key="geometry_uploader",
     )
-    layer_type = st.selectbox(
-        "Layer Type",
-        ["Reservoir Boundary", "Panel / Compartment", "Fault", "Custom"],
+    geometry_role_to_type = {
+        "Reservoir Outer Boundary": "Reservoir Boundary",
+        "Panel / Compartment Polygons": "Panel / Compartment",
+        "Fault Lines": "Fault",
+        "Reference / Custom Geometry": "Custom",
+    }
+    geometry_role = st.selectbox(
+        "Geometry Role",
+        list(geometry_role_to_type),
         key="geometry_layer_type",
     )
-    layer_name = st.text_input("Layer Name", value=layer_type, key="geometry_layer_name")
+    layer_type = geometry_role_to_type[geometry_role]
+    layer_name = st.text_input("Geometry Name", value=geometry_role, key="geometry_layer_name")
 
     if uploaded_geometry is not None:
         extension = uploaded_geometry.name.lower().rsplit(".", 1)[-1]
@@ -349,7 +356,8 @@ with geometry_tab:
                 suggested = suggest_geometry_name_attribute(property_names)
                 options = ["None"] + property_names
                 default_index = options.index(suggested) if suggested in options else 0
-                selected_name_attr = st.selectbox("Name / ID Attribute", options, index=default_index)
+                attr_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Name / ID Attribute"
+                selected_name_attr = st.selectbox(attr_label, options, index=default_index)
                 name_attribute = None if selected_name_attr == "None" else selected_name_attr
             elif extension == "csv":
                 csv_df = pd.read_csv(uploaded_geometry)
@@ -360,7 +368,8 @@ with geometry_tab:
                 geom_y_col = st.selectbox("Geometry Y Column", csv_columns, index=csv_columns.index(y_guess))
                 group_options = ["None"] + csv_columns
                 default_group = "Panel" if "Panel" in csv_columns else ("Polygon_ID" if "Polygon_ID" in csv_columns else "None")
-                group_col = st.selectbox("Polygon / Line ID Column", group_options, index=group_options.index(default_group))
+                group_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Polygon / Line ID Column"
+                group_col = st.selectbox(group_label, group_options, index=group_options.index(default_group))
                 name_attribute = None if group_col == "None" else group_col
             elif extension == "zip":
                 zip_candidates = get_zipped_shapefile_candidates(raw_bytes)
@@ -375,8 +384,9 @@ with geometry_tab:
                 zip_field_options = ["None"] + zip_fields
                 suggested_field = suggest_geometry_name_attribute(zip_fields)
                 default_field_index = zip_field_options.index(suggested_field) if suggested_field in zip_field_options else 0
+                attr_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Name / ID Attribute"
                 selected_field = st.selectbox(
-                    "Name / ID Attribute",
+                    attr_label,
                     zip_field_options,
                     index=default_field_index,
                     key="zip_name_attribute",
