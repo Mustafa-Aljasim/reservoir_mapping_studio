@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterable
 from typing import Literal
 
 import numpy as np
@@ -153,6 +154,33 @@ def descriptive_statistics(values) -> dict[str, float | int | None]:
     }
 
 
+def _collapse_metadata(values: Iterable[object]) -> object:
+    unique = []
+    for value in values:
+        if pd.isna(value):
+            continue
+        text = str(value)
+        if text not in unique:
+            unique.append(text)
+    if not unique:
+        return None
+    if len(unique) == 1:
+        return unique[0]
+    return "|".join(unique)
+
+
+def _source_row_ids(values: Iterable[object]) -> tuple[int, ...]:
+    ids: list[int] = []
+    for value in values:
+        if pd.isna(value):
+            continue
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return tuple(ids)
+
+
 def prepare_interpolation_dataframe(
     df: pd.DataFrame,
     x_col: str,
@@ -160,8 +188,15 @@ def prepare_interpolation_dataframe(
     property_col: str,
     include_col: str = INCLUDE_COLUMN,
     duplicate_method: DuplicateMethod = "Average",
+    metadata_columns: list[str] | None = None,
+    row_id_col: str | None = None,
 ) -> pd.DataFrame:
-    """Return finite, included observations aggregated by duplicate XY as needed."""
+    """Return finite, included observations aggregated by duplicate XY as needed.
+
+    Metadata is optional and is collapsed only after filtering/date selection has
+    already occurred. This prevents pressure snapshots from different map
+    reference dates from being averaged together by duplicate XY handling.
+    """
 
     working = df.copy()
     if include_col in working.columns:
@@ -175,24 +210,38 @@ def prepare_interpolation_dataframe(
         },
         index=working.index,
     )
+    metadata_columns = [
+        column
+        for column in (metadata_columns or [])
+        if column in working.columns and column not in {"X", "Y", "Z"}
+    ]
+    for column in metadata_columns:
+        prepared[column] = working[column]
+    if row_id_col and row_id_col in working.columns:
+        prepared[row_id_col] = working[row_id_col]
     prepared = prepared.replace([np.inf, -np.inf], np.nan).dropna(subset=["X", "Y", "Z"])
     if prepared.empty:
         return prepared.reset_index(drop=True)
 
+    aggregations = {"Source_Count": ("Z", "size")}
+    for column in metadata_columns:
+        aggregations[column] = (column, _collapse_metadata)
+    if row_id_col and row_id_col in prepared.columns:
+        aggregations["Source_Row_IDs"] = (row_id_col, _source_row_ids)
+
     if duplicate_method == "Average":
-        grouped = prepared.groupby(["X", "Y"], as_index=False).agg(Z=("Z", "mean"), Source_Count=("Z", "size"))
+        grouped = prepared.groupby(["X", "Y"], as_index=False).agg(Z=("Z", "mean"), **aggregations)
     elif duplicate_method == "Median":
-        grouped = prepared.groupby(["X", "Y"], as_index=False).agg(Z=("Z", "median"), Source_Count=("Z", "size"))
+        grouped = prepared.groupby(["X", "Y"], as_index=False).agg(Z=("Z", "median"), **aggregations)
     elif duplicate_method == "Keep first":
-        grouped = prepared.drop_duplicates(subset=["X", "Y"], keep="first").copy()
-        grouped["Source_Count"] = prepared.groupby(["X", "Y"])["Z"].transform("size").loc[grouped.index].to_numpy()
-        grouped = grouped[["X", "Y", "Z", "Source_Count"]]
+        representatives = prepared.drop_duplicates(subset=["X", "Y"], keep="first")[["X", "Y", "Z"]].copy()
+        metadata = prepared.groupby(["X", "Y"], as_index=False).agg(**aggregations)
+        grouped = representatives.merge(metadata, on=["X", "Y"], how="left")
     elif duplicate_method == "Keep last":
-        grouped = prepared.drop_duplicates(subset=["X", "Y"], keep="last").copy()
-        grouped["Source_Count"] = prepared.groupby(["X", "Y"])["Z"].transform("size").loc[grouped.index].to_numpy()
-        grouped = grouped[["X", "Y", "Z", "Source_Count"]]
+        representatives = prepared.drop_duplicates(subset=["X", "Y"], keep="last")[["X", "Y", "Z"]].copy()
+        metadata = prepared.groupby(["X", "Y"], as_index=False).agg(**aggregations)
+        grouped = representatives.merge(metadata, on=["X", "Y"], how="left")
     else:
         raise ValueError(f"Unknown duplicate handling method: {duplicate_method}")
 
     return grouped.reset_index(drop=True)
-

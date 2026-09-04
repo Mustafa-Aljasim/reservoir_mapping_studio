@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from core.active_data import (
+    PANEL_INTERPOLATION_MODES,
+    PANEL_MODE_COMBINED,
+    panel_mode_from_legacy,
+)
 from core.column_mapper import categorical_filter_candidates, suggest_mappings
 from core.data_loader import add_internal_row_id, normalize_columns
 from core.filtering import (
@@ -23,6 +29,8 @@ from utils.constants import (
     UNIT_PRESETS,
 )
 from core.crs import LOCAL_CRS_MODE, local_crs
+from core.geometry.compartment import panel_feature_names
+from core.pressure_dates import format_map_date, validate_date_column
 from utils.units import coordinate_unit_key_from_label, coordinate_unit_label, coordinate_unit_labels
 
 
@@ -52,6 +60,8 @@ def ensure_session_state() -> None:
         "filter_values": {},
         "coordinate_unit": DEFAULT_COORDINATE_UNIT,
         "pressure_reference_date": None,
+        "selected_panels": [],
+        "panel_interpolation_mode": PANEL_MODE_COMBINED,
         "geometry_layers": {
             "reservoir_boundary": None,
             "panels": None,
@@ -81,6 +91,9 @@ def ensure_session_state() -> None:
             "experimental_variogram": None,
             "cross_validation": None,
             "method_comparison": None,
+            "variogram_settings": {},
+            "cross_validation_signature": {},
+            "method_comparison_signature": {},
         },
         "current_property": None,
         "property_unit": "",
@@ -123,6 +136,8 @@ def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | N
     st.session_state.additional_filter_columns = []
     st.session_state.filter_values = {}
     st.session_state.pressure_reference_date = None
+    st.session_state.selected_panels = []
+    st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
     st.session_state.current_property = None
     st.session_state.include_state = {}
     st.session_state.generated_map = None
@@ -165,6 +180,8 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
     st.session_state.additional_filter_columns = []
     st.session_state.filter_values = {}
     st.session_state.pressure_reference_date = None
+    st.session_state.selected_panels = []
+    st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
     st.session_state.geometry_layers = {
         "reservoir_boundary": None,
         "panels": None,
@@ -177,6 +194,8 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
         "experimental_variogram": None,
         "cross_validation": None,
         "method_comparison": None,
+        "variogram_settings": {},
+        "cross_validation_signature": {},
     }
     st.session_state.current_property = None
     st.session_state.property_unit = ""
@@ -342,6 +361,99 @@ def coordinate_unit_input(key: str = "coordinate_unit_input") -> str:
     )
     st.session_state.coordinate_unit = coordinate_unit_key_from_label(selected_label)
     return st.session_state.coordinate_unit
+
+
+def pressure_reference_date_control(
+    df: pd.DataFrame,
+    mappings: dict[str, str | None],
+    key: str = "pressure_reference_date_input",
+) -> tuple[date | None, object | None]:
+    reference_col = mappings.get("map_reference_date")
+    validation = None
+    detected_common_date = None
+    available_dates: list[date] = []
+    if reference_col and reference_col in df.columns:
+        validation = validate_date_column(df[reference_col])
+        available_dates = list(validation.unique_dates)
+        detected_common_date = validation.common_date
+        if detected_common_date:
+            st.caption(f"Detected common Pressure Map Reference Date: {format_map_date(detected_common_date)}")
+        elif validation.has_multiple_dates:
+            st.caption(
+                "Multiple Pressure Map Reference Dates are present. Select the prepared pressure snapshot to use."
+            )
+        if validation.failed_count:
+            st.warning(f"{validation.failed_count} pressure map reference date value(s) could not be parsed.")
+
+        if available_dates:
+            current_reference_date = st.session_state.get("pressure_reference_date")
+            if current_reference_date not in available_dates:
+                current_reference_date = available_dates[0]
+            selected_reference_date = available_dates[0]
+            if len(available_dates) > 1:
+                selected_reference_date = st.selectbox(
+                    "Pressure Map Reference Date",
+                    available_dates,
+                    index=available_dates.index(current_reference_date),
+                    format_func=format_map_date,
+                    key=key,
+                    help="Select the prepared pressure-map reference date for this spatial interpolation. Original measurement dates remain metadata only.",
+                )
+            st.session_state.pressure_reference_date = selected_reference_date
+            return selected_reference_date, validation
+
+    current_reference_date = st.session_state.get("pressure_reference_date") or detected_common_date or date.today()
+    selected_reference_date = st.date_input(
+        "Pressure Map Reference Date",
+        value=current_reference_date,
+        key=key,
+        help="A single reference date represented by the supplied pressure values. No temporal extrapolation is performed.",
+    )
+    st.session_state.pressure_reference_date = selected_reference_date
+    return selected_reference_date, validation
+
+
+def panel_selection_control(panel_layer, key: str = "selected_panels") -> list[str]:
+    options = panel_feature_names(panel_layer)
+    if not options:
+        st.session_state.selected_panels = []
+        st.session_state[key] = []
+        return []
+    if key in st.session_state:
+        current = [value for value in st.session_state.get(key, []) if value in options]
+    else:
+        current = [value for value in st.session_state.get("selected_panels", []) if value in options]
+    if not current and key not in st.session_state:
+        current = options
+    selected = st.multiselect(
+        "Panel Selection",
+        options,
+        default=current,
+        key=key,
+        help="Select which panel observations participate in the active model.",
+    )
+    st.session_state.selected_panels = selected
+    return selected
+
+
+def panel_interpolation_mode_control(
+    has_panel_layer: bool,
+    key: str = "panel_interpolation_mode",
+) -> str:
+    if not has_panel_layer:
+        st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
+        return PANEL_MODE_COMBINED
+    current = panel_mode_from_legacy(st.session_state.get("panel_interpolation_mode"), False)
+    selected = st.radio(
+        "Panel Interpolation Mode",
+        PANEL_INTERPOLATION_MODES,
+        index=PANEL_INTERPOLATION_MODES.index(current),
+        horizontal=True,
+        key=key,
+        help="Combined pools selected panels into one interpolation model. Independent treats selected panels as separated compartments.",
+    )
+    st.session_state.panel_interpolation_mode = selected
+    return selected
 
 
 def color_scale_options() -> list[str]:

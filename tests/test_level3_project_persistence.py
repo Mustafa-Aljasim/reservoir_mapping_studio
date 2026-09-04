@@ -3,17 +3,55 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from core.active_data import PANEL_MODE_COMBINED, PANEL_MODE_INDEPENDENT, build_model_signature
+from core.geostatistics.variogram import (
+    VARIOGRAM_RANGE_CONVENTION,
+    ExperimentalVariogram,
+    VariogramFit,
+)
 from core.map_comparison import calculate_delta, calculate_pressure_change
 from core.project_io import load_project_archive, save_project_archive
 from core.scenarios import create_map_scenario
+from utils.constants import INCLUDE_COLUMN, INTERNAL_ROW_ID
 
 
 def _example_generated_map(name: str, pressure_reference_date: str, value: float):
+    included = pd.DataFrame(
+        {
+            INTERNAL_ROW_ID: [10, 11],
+            INCLUDE_COLUMN: [True, True],
+            "X": [0.0, 1.0],
+            "Y": [0.0, 1.0],
+            "Pressure": [value, value],
+            "Panel": ["A", "B"],
+        }
+    )
+    signature = build_model_signature(
+        property_column="Pressure",
+        property_type="Pressure",
+        pressure_reference_date=pressure_reference_date,
+        selected_panels=["A", "B"],
+        selected_layers=["L1"],
+        panel_interpolation_mode=PANEL_MODE_COMBINED,
+        filter_values={"Layer": ["L1"]},
+        active_dataframe=included,
+        duplicate_method="Average",
+        interpolation_method="Ordinary Kriging",
+        interpolation_parameters={
+            "variogram_model": "Spherical",
+            "variogram_range_convention": VARIOGRAM_RANGE_CONVENTION,
+            "range": 10.0,
+            "variance": 50.0,
+            "nugget": 0.0,
+        },
+    )
     return {
         "grid_x": np.array([[0.0, 1.0], [0.0, 1.0]], dtype=float),
         "grid_y": np.array([[0.0, 0.0], [1.0, 1.0]], dtype=float),
         "grid_z": np.array([[value, value], [value, value]], dtype=float),
+        "grid_variance": np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
         "property_col": "Pressure",
+        "property_type": "Pressure",
         "method": "Ordinary Kriging",
         "title": name,
         "unit": "psi",
@@ -25,17 +63,34 @@ def _example_generated_map(name: str, pressure_reference_date: str, value: float
         "x_col": "X",
         "y_col": "Y",
         "well_col": "Well",
-        "method_parameters": {"variogram_model": "Spherical"},
+        "method_parameters": {
+            "variogram_model": "Spherical",
+            "variogram_range_convention": VARIOGRAM_RANGE_CONVENTION,
+            "range": 10.0,
+            "variance": 50.0,
+            "nugget": 0.0,
+        },
         "grid_parameters": {"nx": 2, "ny": 2},
         "mask_parameters": {"mode": "No Mask"},
         "mask_info": {"mask_mode": "No Mask"},
         "geometry_context": {"panel_boundaries": False},
+        "geometry_references": {
+            "reservoir_boundary_name": "R1 Boundary",
+            "selected_panel_names": ["A", "B"],
+            "selected_panel_bounds": [0.0, 0.0, 2.0, 1.0],
+        },
         "duplicate_method": "Average",
         "respect_compartments": False,
+        "panel_interpolation_mode": PANEL_MODE_COMBINED,
+        "selected_panels": ["A", "B"],
+        "selected_layers": ["L1"],
+        "interpolation_domain": "Selected Panel Extent",
+        "domain_bounds": [0.0, 0.0, 2.0, 1.0],
         "hover_columns": ["Well"],
-        "export_metadata": {"property": "Pressure"},
-        "included_observations": pd.DataFrame({"X": [0.0, 1.0], "Y": [0.0, 1.0], "Pressure": [value, value]}),
-        "excluded_observations": pd.DataFrame(columns=["X", "Y", "Pressure"]),
+        "export_metadata": {"property": "Pressure", "Variogram_Range_Convention": VARIOGRAM_RANGE_CONVENTION},
+        "included_observations": included,
+        "excluded_observations": pd.DataFrame(columns=[INTERNAL_ROW_ID, INCLUDE_COLUMN, "X", "Y", "Pressure"]),
+        "model_signature": signature,
     }
 
 
@@ -122,3 +177,120 @@ def test_delta_map_and_pressure_change_are_correct():
     assert pressure_change.metadata["Date_A"] == "2025-01-01"
     assert pressure_change.metadata["Date_B"] == "2026-01-01"
     assert pressure_change.metadata["Operation"] == "Pressure Change = Later - Earlier"
+
+
+def test_scenario_snapshot_is_immutable_after_generated_map_mutation():
+    generated = _example_generated_map("Pressure 2025", "2025-01-01", 3000.0)
+    scenario = create_map_scenario(
+        "Pressure 2025",
+        generated,
+        {
+            "style_settings": {"color_scale": "Turbo"},
+            "layer_settings": {"show_panels": True},
+            "filter_values": {"Layer": ["L1"]},
+            "include_state": {10: True, 11: True},
+            "crs": {"mode": "Local / Unknown XY"},
+        },
+        validation={"metrics": {"RMSE": 12.3}, "signature": generated["model_signature"]},
+    )
+
+    generated["grid_z"][0, 0] = 9999.0
+    generated["grid_variance"][0, 0] = 9999.0
+    generated["method_parameters"]["range"] = 500.0
+    generated["included_observations"].loc[0, "Pressure"] = 1111.0
+
+    assert scenario["grid_z"][0, 0] == 3000.0
+    assert scenario["grid_variance"][0, 0] == 1.0
+    assert scenario["grid_stddev"][1, 1] == 2.0
+    assert scenario["interpolation_parameters"]["range"] == 10.0
+    assert scenario["included_observations"].loc[0, "Pressure"] == 3000.0
+    assert scenario["selected_panels"] == ["A", "B"]
+    assert scenario["panel_interpolation_mode"] == PANEL_MODE_COMBINED
+    assert scenario["validation_metrics"]["RMSE"] == 12.3
+
+
+def test_scenario_and_geostatistics_new_state_round_trip_through_project_archive():
+    generated = _example_generated_map("Pressure 2025", "2025-01-01", 3000.0)
+    scenario = create_map_scenario("Pressure 2025", generated)
+    experimental = ExperimentalVariogram(
+        lag_distance=np.array([1.0, 2.0, 3.0], dtype=float),
+        semivariance=np.array([10.0, 20.0, 30.0], dtype=float),
+        pair_count=np.array([2, 3, 4], dtype=int),
+        max_lag=3.0,
+        n_lags=3,
+    )
+    fit = VariogramFit("Gaussian", 25.0, 100.0, 5.0, 0.12)
+    state = {
+        "project_metadata": {"name": "Reproducible Project"},
+        "source_name": "sample.csv",
+        "column_mappings": {
+            "x": "X",
+            "y": "Y",
+            "property": "Pressure",
+            "well": "Well",
+            "panel": "Panel",
+            "map_reference_date": "Pressure_Map_Reference_Date",
+        },
+        "filter_values": {"Layer": ["L1"]},
+        "coordinate_unit": "m",
+        "property_unit": "psi",
+        "pressure_reference_date": "2025-01-01",
+        "selected_panels": ["A", "B"],
+        "panel_interpolation_mode": PANEL_MODE_INDEPENDENT,
+        "crs": {"mode": "Local / Unknown XY"},
+        "include_state": {10: True, 11: True},
+        "layer_settings": {"show_panels": True},
+        "style_settings": {"color_scale": "Turbo"},
+        "current_property": "Pressure",
+        "geostatistics": {
+            "experimental_variogram": experimental,
+            "variogram_fit": fit,
+            "variogram_fits": [fit],
+            "variogram_settings": {
+                "property": "Pressure",
+                "property_type": "Pressure",
+                "pressure_reference_date": "2025-01-01",
+                "selected_panels": ["A", "B"],
+                "panel_interpolation_mode": PANEL_MODE_INDEPENDENT,
+                "selected_layers": ["L1"],
+                "duplicate_method": "Average",
+                "range_convention": VARIOGRAM_RANGE_CONVENTION,
+            },
+            "anisotropy_enabled": True,
+            "anisotropy_angle": 35.0,
+            "anisotropy_ratio": 0.45,
+            "cross_validation_signature": generated["model_signature"],
+        },
+        "geometry_layers": {"reservoir_boundary": None, "panels": None, "faults": None, "custom": []},
+        "map_scenarios": [scenario],
+        "current_scenario_id": scenario["id"],
+        "working_df": pd.DataFrame(
+            {
+                "X": [0.0, 1.0],
+                "Y": [0.0, 1.0],
+                "Pressure": [3000.0, 3000.0],
+                "Panel": ["A", "B"],
+                "Pressure_Map_Reference_Date": ["2025-01-01", "2025-01-01"],
+            }
+        ),
+    }
+
+    restored = load_project_archive(save_project_archive(state))
+    restored_scenario = restored["map_scenarios"][0]
+    restored_geo = restored["geostatistics"]
+
+    assert restored["selected_panels"] == ["A", "B"]
+    assert restored["panel_interpolation_mode"] == PANEL_MODE_INDEPENDENT
+    assert restored_scenario["selected_panels"] == ["A", "B"]
+    assert restored_scenario["panel_interpolation_mode"] == PANEL_MODE_COMBINED
+    assert np.array_equal(restored_scenario["grid_z"], scenario["grid_z"])
+    assert np.array_equal(restored_scenario["grid_stddev"], scenario["grid_stddev"])
+    assert restored_scenario["interpolation_parameters"]["variogram_range_convention"] == VARIOGRAM_RANGE_CONVENTION
+    assert restored_geo["variogram_fit"].model == "Gaussian"
+    assert restored_geo["variogram_fit"].range_value == 25.0
+    assert restored_geo["experimental_variogram"].n_lags == 3
+    assert restored_geo["variogram_settings"]["range_convention"] == VARIOGRAM_RANGE_CONVENTION
+    assert restored_geo["anisotropy_enabled"]
+    assert restored_geo["anisotropy_angle"] == 35.0
+    assert restored_geo["anisotropy_ratio"] == 0.45
+    assert restored_geo["cross_validation_signature"]["hash"] == generated["model_signature"]["hash"]

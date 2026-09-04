@@ -12,15 +12,18 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import mapping
 
+from core.active_data import panel_mode_from_legacy
 from core.crs import normalize_crs_config
 from core.data_loader import add_internal_row_id
 from core.geometry.loader import load_geojson_bytes
 from core.geometry.models import GeometryLayer
-from core.scenarios import scenario_metadata
+from core.geostatistics.variogram import ExperimentalVariogram, VariogramFit
+from core.scenarios import json_safe, scenario_metadata
 from utils.constants import INTERNAL_ROW_ID
 
 
-PROJECT_SCHEMA_VERSION = "1.0"
+PROJECT_SCHEMA_VERSION = "1.1"
+SUPPORTED_PROJECT_SCHEMA_VERSIONS = {"1.0", PROJECT_SCHEMA_VERSION}
 
 
 class ProjectArchiveError(ValueError):
@@ -76,6 +79,8 @@ def _write_scenario(archive: zipfile.ZipFile, scenario: dict[str, object]) -> di
     }
     if scenario.get("grid_variance") is not None:
         arrays["grid_variance"] = np.asarray(scenario["grid_variance"], dtype=float)
+    if scenario.get("grid_stddev") is not None:
+        arrays["grid_stddev"] = np.asarray(scenario["grid_stddev"], dtype=float)
     if scenario.get("panel_grid") is not None:
         panel = np.asarray(scenario["panel_grid"], dtype=object)
         arrays["panel_grid"] = np.where(pd.isna(panel), "", panel.astype(str))
@@ -92,6 +97,73 @@ def _write_scenario(archive: zipfile.ZipFile, scenario: dict[str, object]) -> di
     return {"id": scenario_id, "metadata_path": f"{base}.json", "arrays_path": f"{base}.npz"}
 
 
+def _serialize_geostatistics(geostatistics: dict[str, object] | None) -> dict[str, object]:
+    geostatistics = geostatistics or {}
+    serialized = {
+        "variogram_fit": json_safe(geostatistics.get("variogram_fit")),
+        "variogram_fits": json_safe(geostatistics.get("variogram_fits", [])),
+        "experimental_variogram": json_safe(geostatistics.get("experimental_variogram")),
+        "variogram_settings": json_safe(geostatistics.get("variogram_settings", {})),
+        "anisotropy_enabled": bool(geostatistics.get("anisotropy_enabled", False)),
+        "anisotropy_angle": geostatistics.get("anisotropy_angle", 0.0),
+        "anisotropy_ratio": geostatistics.get("anisotropy_ratio", 1.0),
+    }
+    cross_validation = geostatistics.get("cross_validation") or {}
+    cross_validation_signature = geostatistics.get("cross_validation_signature", {})
+    if isinstance(cross_validation, dict):
+        cross_validation_signature = cross_validation.get("signature", {}) or cross_validation_signature
+    serialized["cross_validation_signature"] = json_safe(cross_validation_signature)
+    method_comparison = geostatistics.get("method_comparison")
+    if isinstance(method_comparison, pd.DataFrame):
+        serialized["method_comparison"] = method_comparison.to_dict(orient="records")
+    elif isinstance(method_comparison, dict):
+        serialized["method_comparison_signature"] = json_safe(method_comparison.get("signature", {}))
+    return serialized
+
+
+def _restore_variogram_fit(payload) -> VariogramFit | None:
+    if not payload:
+        return None
+    return VariogramFit(
+        model=str(payload["model"]),
+        range_value=float(payload["range_value"]),
+        variance=float(payload["variance"]),
+        nugget=float(payload["nugget"]),
+        fit_error=float(payload.get("fit_error", 0.0)),
+    )
+
+
+def _restore_experimental_variogram(payload) -> ExperimentalVariogram | None:
+    if not payload:
+        return None
+    return ExperimentalVariogram(
+        lag_distance=np.asarray(payload["lag_distance"], dtype=float),
+        semivariance=np.asarray(payload["semivariance"], dtype=float),
+        pair_count=np.asarray(payload["pair_count"], dtype=int),
+        max_lag=float(payload["max_lag"]),
+        n_lags=int(payload["n_lags"]),
+    )
+
+
+def _restore_geostatistics(payload: dict[str, object] | None) -> dict[str, object]:
+    payload = payload or {}
+    return {
+        "variogram_fit": _restore_variogram_fit(payload.get("variogram_fit")),
+        "variogram_fits": [
+            fit for fit in (_restore_variogram_fit(item) for item in payload.get("variogram_fits", []) or []) if fit
+        ],
+        "experimental_variogram": _restore_experimental_variogram(payload.get("experimental_variogram")),
+        "variogram_settings": payload.get("variogram_settings", {}),
+        "anisotropy_enabled": bool(payload.get("anisotropy_enabled", False)),
+        "anisotropy_angle": float(payload.get("anisotropy_angle", 0.0)),
+        "anisotropy_ratio": float(payload.get("anisotropy_ratio", 1.0)),
+        "cross_validation": None,
+        "cross_validation_signature": payload.get("cross_validation_signature", {}),
+        "method_comparison": None,
+        "method_comparison_signature": payload.get("method_comparison_signature", {}),
+    }
+
+
 def save_project_archive(state: dict[str, object]) -> bytes:
     buffer = BytesIO()
     manifest: dict[str, object] = {
@@ -104,11 +176,14 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "coordinate_unit": state.get("coordinate_unit"),
         "property_unit": state.get("property_unit", ""),
         "pressure_reference_date": state.get("pressure_reference_date"),
+        "selected_panels": state.get("selected_panels", []),
+        "panel_interpolation_mode": panel_mode_from_legacy(state.get("panel_interpolation_mode"), False),
         "crs": normalize_crs_config(state.get("crs", {})),
         "include_state": state.get("include_state", {}),
         "layer_settings": state.get("layer_settings", {}),
         "style_settings": state.get("style_settings", {}),
         "current_property": state.get("current_property"),
+        "geostatistics": _serialize_geostatistics(state.get("geostatistics", {})),
         "geometry_layers": [],
         "map_scenarios": [],
         "current_scenario_id": state.get("current_scenario_id"),
@@ -166,7 +241,7 @@ def load_project_archive(data: bytes) -> dict[str, object]:
 
     with archive:
         manifest = _read_json(archive, "project.json")
-        if str(manifest.get("project_schema_version")) != PROJECT_SCHEMA_VERSION:
+        if str(manifest.get("project_schema_version")) not in SUPPORTED_PROJECT_SCHEMA_VERSIONS:
             raise ProjectArchiveError(
                 f"Unsupported project schema version: {manifest.get('project_schema_version')}."
             )
@@ -180,10 +255,13 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             "coordinate_unit": manifest.get("coordinate_unit"),
             "property_unit": manifest.get("property_unit", ""),
             "pressure_reference_date": _parse_iso_date(manifest.get("pressure_reference_date")),
+            "selected_panels": manifest.get("selected_panels", []),
+            "panel_interpolation_mode": panel_mode_from_legacy(manifest.get("panel_interpolation_mode"), False),
             "crs": normalize_crs_config(manifest.get("crs", {})),
             "include_state": {int(key): bool(value) for key, value in dict(manifest.get("include_state", {})).items()},
             "layer_settings": manifest.get("layer_settings", {}),
             "style_settings": manifest.get("style_settings", {}),
+            "geostatistics": _restore_geostatistics(manifest.get("geostatistics", {})),
             "current_property": manifest.get("current_property"),
             "geometry_layers": {"reservoir_boundary": None, "panels": None, "faults": None, "custom": []},
             "map_scenarios": [],
@@ -213,9 +291,13 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             metadata = _read_json(archive, str(scenario_info["metadata_path"]))
             arrays = np.load(BytesIO(archive.read(str(scenario_info["arrays_path"]))), allow_pickle=False)
             scenario = dict(metadata)
-            for key in ("grid_x", "grid_y", "grid_z", "grid_variance"):
+            for key in ("grid_x", "grid_y", "grid_z", "grid_variance", "grid_stddev"):
                 if key in arrays:
                     scenario[key] = arrays[key]
+            scenario["panel_interpolation_mode"] = panel_mode_from_legacy(
+                scenario.get("panel_interpolation_mode"),
+                bool(scenario.get("respect_compartments", False)),
+            )
             if "panel_grid" in arrays:
                 panel = arrays["panel_grid"].astype(object)
                 scenario["panel_grid"] = np.where(panel == "", None, panel)

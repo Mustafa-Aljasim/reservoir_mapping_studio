@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
+from core.active_data import panel_mode_from_legacy
+from utils.constants import INTERNAL_ROW_ID
 
-ARRAY_KEYS = {"grid_x", "grid_y", "grid_z", "grid_variance", "panel_grid"}
+
+ARRAY_KEYS = {"grid_x", "grid_y", "grid_z", "grid_variance", "grid_stddev", "panel_grid"}
 DATAFRAME_KEYS = {"included_observations", "excluded_observations"}
 
 
@@ -19,6 +23,8 @@ def _now_iso() -> str:
 
 
 def json_safe(value):
+    if is_dataclass(value):
+        return json_safe(asdict(value))
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -32,6 +38,30 @@ def json_safe(value):
     if isinstance(value, pd.DataFrame):
         return value.to_dict(orient="records")
     return value
+
+
+def _observation_ids(frame: pd.DataFrame) -> list[int]:
+    if not isinstance(frame, pd.DataFrame) or INTERNAL_ROW_ID not in frame.columns:
+        return []
+    ids: list[int] = []
+    for value in frame[INTERNAL_ROW_ID].dropna().tolist():
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _current_validation(generated_map: dict[str, object], validation: dict[str, object] | None) -> dict[str, object] | None:
+    if not validation:
+        return None
+    generated_signature = generated_map.get("model_signature") or {}
+    validation_signature = validation.get("signature") or {}
+    if generated_signature and validation_signature and generated_signature.get("hash") == validation_signature.get("hash"):
+        return validation
+    if generated_signature or validation_signature:
+        return None
+    return validation
 
 
 def create_map_scenario(
@@ -48,6 +78,14 @@ def create_map_scenario(
     if missing:
         raise ValueError(f"Generated map is missing required field(s): {', '.join(missing)}.")
 
+    included_observations = generated_map.get("included_observations", pd.DataFrame()).copy()
+    excluded_observations = generated_map.get("excluded_observations", pd.DataFrame()).copy()
+    grid_variance = generated_map.get("grid_variance")
+    validation_current = _current_validation(generated_map, validation)
+    panel_mode = panel_mode_from_legacy(
+        generated_map.get("panel_interpolation_mode"),
+        bool(generated_map.get("respect_compartments", False)),
+    )
     scenario = {
         "scenario_schema_version": "1.0",
         "id": scenario_id or uuid4().hex,
@@ -55,6 +93,7 @@ def create_map_scenario(
         "created_time": _now_iso(),
         "title": generated_map.get("title") or name.strip() or "Saved Map",
         "property": generated_map.get("property_col"),
+        "property_type": generated_map.get("property_type") or ("Pressure" if generated_map.get("is_pressure_map") else "Generic"),
         "property_unit": generated_map.get("unit") or "",
         "coordinate_unit": generated_map.get("coordinate_unit"),
         "is_pressure_map": bool(generated_map.get("is_pressure_map", False)),
@@ -67,28 +106,42 @@ def create_map_scenario(
         "interpolation_method": generated_map.get("method"),
         "interpolation_parameters": json_safe(generated_map.get("method_parameters", {})),
         "grid_parameters": json_safe(generated_map.get("grid_parameters", {})),
+        "interpolation_domain": generated_map.get("interpolation_domain"),
+        "domain_bounds": json_safe(generated_map.get("domain_bounds")),
         "mask_parameters": json_safe(generated_map.get("mask_parameters", {})),
         "mask_info": json_safe(generated_map.get("mask_info", {})),
         "duplicate_method": generated_map.get("duplicate_method"),
-        "respect_compartments": bool(generated_map.get("respect_compartments", False)),
+        "respect_compartments": panel_mode == "Independent by Panel / Compartment",
+        "panel_interpolation_mode": panel_mode,
+        "selected_panels": json_safe(generated_map.get("selected_panels", [])),
+        "selected_layers": json_safe(generated_map.get("selected_layers", [])),
         "geometry_context": json_safe(generated_map.get("geometry_context", {})),
+        "geometry_references": json_safe(generated_map.get("geometry_references", {})),
         "style_settings": json_safe((project_context or {}).get("style_settings", {})),
         "layer_settings": json_safe((project_context or {}).get("layer_settings", {})),
         "filter_values": json_safe((project_context or {}).get("filter_values", {})),
         "include_state": json_safe((project_context or {}).get("include_state", {})),
+        "included_observation_ids": _observation_ids(included_observations),
+        "excluded_observation_ids": _observation_ids(excluded_observations),
         "crs": json_safe((project_context or {}).get("crs", {})),
         "export_metadata": json_safe(generated_map.get("export_metadata", {})),
         "hover_columns": json_safe(generated_map.get("hover_columns", [])),
-        "validation_metrics": json_safe((validation or {}).get("metrics", validation or {})),
-        "grid_x": np.asarray(generated_map["grid_x"], dtype=float),
-        "grid_y": np.asarray(generated_map["grid_y"], dtype=float),
-        "grid_z": np.asarray(generated_map["grid_z"], dtype=float),
+        "validation_metrics": json_safe((validation_current or {}).get("metrics", {})),
+        "validation_signature": json_safe((validation_current or {}).get("signature", {})),
+        "model_signature": json_safe(generated_map.get("model_signature", {})),
+        "model_signature_hash": (generated_map.get("model_signature") or {}).get("hash", ""),
+        "grid_x": np.asarray(generated_map["grid_x"], dtype=float).copy(),
+        "grid_y": np.asarray(generated_map["grid_y"], dtype=float).copy(),
+        "grid_z": np.asarray(generated_map["grid_z"], dtype=float).copy(),
         "grid_variance": None
-        if generated_map.get("grid_variance") is None
-        else np.asarray(generated_map["grid_variance"], dtype=float),
-        "panel_grid": None if generated_map.get("panel_grid") is None else np.asarray(generated_map["panel_grid"], dtype=object),
-        "included_observations": generated_map.get("included_observations", pd.DataFrame()).copy(),
-        "excluded_observations": generated_map.get("excluded_observations", pd.DataFrame()).copy(),
+        if grid_variance is None
+        else np.asarray(grid_variance, dtype=float).copy(),
+        "grid_stddev": None
+        if grid_variance is None
+        else np.sqrt(np.maximum(np.asarray(grid_variance, dtype=float), 0.0)).copy(),
+        "panel_grid": None if generated_map.get("panel_grid") is None else np.asarray(generated_map["panel_grid"], dtype=object).copy(),
+        "included_observations": included_observations,
+        "excluded_observations": excluded_observations,
     }
     return scenario
 
@@ -105,6 +158,7 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "included_observations": scenario.get("included_observations", pd.DataFrame()).copy(),
         "excluded_observations": scenario.get("excluded_observations", pd.DataFrame()).copy(),
         "property_col": scenario.get("property"),
+        "property_type": scenario.get("property_type") or ("Pressure" if scenario.get("is_pressure_map") else "Generic"),
         "unit": scenario.get("property_unit") or "",
         "x_col": scenario.get("x_col"),
         "y_col": scenario.get("y_col"),
@@ -117,14 +171,24 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "method": scenario.get("interpolation_method"),
         "method_parameters": deepcopy(scenario.get("interpolation_parameters", {})),
         "grid_parameters": deepcopy(scenario.get("grid_parameters", {})),
+        "interpolation_domain": scenario.get("interpolation_domain"),
+        "domain_bounds": deepcopy(scenario.get("domain_bounds")),
         "mask_parameters": deepcopy(scenario.get("mask_parameters", {})),
         "mask_info": deepcopy(scenario.get("mask_info", {})),
         "respect_compartments": bool(scenario.get("respect_compartments", False)),
+        "panel_interpolation_mode": panel_mode_from_legacy(
+            scenario.get("panel_interpolation_mode"),
+            bool(scenario.get("respect_compartments", False)),
+        ),
+        "selected_panels": deepcopy(scenario.get("selected_panels", [])),
+        "selected_layers": deepcopy(scenario.get("selected_layers", [])),
         "geometry_context": deepcopy(scenario.get("geometry_context", {})),
+        "geometry_references": deepcopy(scenario.get("geometry_references", {})),
         "duplicate_method": scenario.get("duplicate_method"),
         "hover_columns": deepcopy(scenario.get("hover_columns", [])),
         "title": scenario.get("title") or scenario.get("name"),
         "export_metadata": deepcopy(scenario.get("export_metadata", {})),
+        "model_signature": deepcopy(scenario.get("model_signature", {})),
     }
 
 

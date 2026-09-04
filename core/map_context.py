@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import date
 
+import numpy as np
+
+from core.active_data import panel_mode_from_legacy
 from core.pressure_dates import format_map_date
 from utils.units import coordinate_unit_symbol
 
@@ -42,23 +45,59 @@ def build_map_metadata(
     is_pressure_map: bool = False,
     map_reference_date: date | None = None,
     geometry_context: dict[str, object] | None = None,
+    property_type: str | None = None,
+    crs: dict[str, object] | None = None,
+    selected_panels: list[object] | tuple[object, ...] | None = None,
+    panel_interpolation_mode: str | None = None,
+    selected_layers: list[object] | tuple[object, ...] | None = None,
+    interpolation_domain: str | None = None,
+    domain_bounds: tuple[float, float, float, float] | list[float] | None = None,
+    grid_x=None,
+    grid_y=None,
+    validation_metrics: dict[str, object] | None = None,
+    model_signature_hash: str | None = None,
 ) -> dict[str, object]:
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
     metadata: dict[str, object] = {
         "Property": property_name,
+        "Property_Type": property_type or ("Pressure" if is_pressure_map else "Generic"),
         "Property_Unit": property_unit or "",
         "X_Column": x_column,
         "Y_Column": y_column,
         "Coordinate_Unit": unit_symbol,
+        "CRS_Mode": (crs or {}).get("mode", ""),
+        "CRS_EPSG": (crs or {}).get("epsg", ""),
         "Interpolation_Method": interpolation_method,
         "Grid_NX": grid_parameters.get("nx"),
         "Grid_NY": grid_parameters.get("ny"),
         "Grid_Buffer_Percent": round(float(grid_parameters.get("buffer_fraction", 0.0)) * 100.0, 6),
         "Duplicate_Coordinate_Handling": duplicate_method,
         "Mask": mask_parameters.get("mode"),
+        "Interpolation_Domain": interpolation_domain or grid_parameters.get("interpolation_domain", ""),
+        "Panel_Interpolation_Mode": panel_mode_from_legacy(panel_interpolation_mode, False),
+        "Selected_Panels": ", ".join(str(value) for value in (selected_panels or [])),
+        "Selected_Layers": ", ".join(str(value) for value in (selected_layers or [])),
+        "Variogram_Range_Convention": method_parameters.get("variogram_range_convention", "Practical Range")
+        if interpolation_method == "Ordinary Kriging"
+        else "",
     }
+    if model_signature_hash:
+        metadata["Model_Signature_Hash"] = model_signature_hash
     if is_pressure_map and map_reference_date:
         metadata["Pressure_Map_Reference_Date"] = map_reference_date.isoformat()
+    if domain_bounds is not None:
+        metadata["Domain_Min_X"] = float(domain_bounds[0])
+        metadata["Domain_Min_Y"] = float(domain_bounds[1])
+        metadata["Domain_Max_X"] = float(domain_bounds[2])
+        metadata["Domain_Max_Y"] = float(domain_bounds[3])
+    if grid_x is not None and grid_y is not None:
+        x = np.asarray(grid_x, dtype=float)
+        y = np.asarray(grid_y, dtype=float)
+        if x.ndim == 2 and y.ndim == 2 and x.shape[1] > 1 and y.shape[0] > 1:
+            metadata["Grid_DX_Value"] = float(np.nanmedian(np.diff(x[0, :])))
+            metadata["Grid_DX_Unit"] = unit_symbol
+            metadata["Grid_DY_Value"] = float(np.nanmedian(np.diff(y[:, 0])))
+            metadata["Grid_DY_Unit"] = unit_symbol
 
     geometry_context = geometry_context or {}
     if geometry_context:
@@ -67,6 +106,20 @@ def build_map_metadata(
         metadata["Active_Panels"] = geometry_context.get("active_panels", "")
         metadata["Fault_Layer_Loaded"] = bool(geometry_context.get("fault_layer_loaded", False))
         metadata["Custom_Layer_Count"] = int(geometry_context.get("custom_layer_count", 0) or 0)
+        for key in (
+            "reservoir_boundary_name",
+            "reservoir_boundary_source",
+            "reservoir_boundary_bounds",
+            "panel_layer_name",
+            "panel_layer_source",
+            "panel_bounds",
+            "selected_panel_names",
+            "selected_panel_bounds",
+            "selected_panel_feature_count",
+            "panel_interpolation_mode",
+        ):
+            if key in geometry_context:
+                metadata[key.title().replace("_", "_")] = geometry_context[key]
 
     for key, value in method_parameters.items():
         if key == "search_radius":
@@ -101,4 +154,7 @@ def build_map_metadata(
     if max_distance is not None:
         metadata["Maximum_Distance_Value"] = max_distance
         metadata["Maximum_Distance_Unit"] = unit_symbol
+    if validation_metrics:
+        for key, value in validation_metrics.items():
+            metadata[f"Validation_{key}"] = value
     return metadata

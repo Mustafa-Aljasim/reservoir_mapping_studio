@@ -1,9 +1,16 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from core.geostatistics.kriging import ordinary_kriging_interpolate
 from core.geostatistics.validation import leave_one_out_cross_validation, validation_metrics
-from core.geostatistics.variogram import compute_experimental_variogram, fit_candidate_models
+from core.geostatistics.variogram import (
+    VARIOGRAM_RANGE_CONVENTION,
+    compute_experimental_variogram,
+    evaluate_variogram_model,
+    fit_candidate_models,
+    gstools_len_scale_from_practical_range,
+)
 
 
 def _sample_points():
@@ -48,6 +55,52 @@ def test_ordinary_kriging_returns_estimate_and_uncertainty():
     assert result.variance.shape == grid_x.shape
     assert np.isfinite(result.estimate).any()
     assert np.nanmin(result.variance) >= 0
+
+
+@pytest.mark.parametrize(
+    ("model_name", "class_name"),
+    [
+        ("Spherical", "Spherical"),
+        ("Exponential", "Exponential"),
+        ("Gaussian", "Gaussian"),
+    ],
+)
+def test_user_facing_practical_range_matches_gstools_variogram(model_name, class_name):
+    gs = pytest.importorskip("gstools")
+    practical_range = 10.0
+    variance = 4.0
+    nugget = 1.0
+    distances = np.array([0.0, 2.5, 5.0, 10.0, 15.0], dtype=float)
+
+    len_scale = gstools_len_scale_from_practical_range(model_name, practical_range)
+    gstools_model = getattr(gs, class_name)(dim=2, var=variance, len_scale=len_scale, nugget=nugget)
+    displayed = evaluate_variogram_model(model_name, distances, practical_range, variance, nugget)
+
+    assert VARIOGRAM_RANGE_CONVENTION == "Practical Range"
+    assert np.allclose(displayed, gstools_model.variogram(distances), rtol=1e-8, atol=1e-10)
+
+
+def test_auto_fit_range_parameters_are_kriging_ready_under_same_convention():
+    gs = pytest.importorskip("gstools")
+    x, y, z = _sample_points()
+    experimental = compute_experimental_variogram(x, y, z, n_lags=5)
+    fit = fit_candidate_models(experimental)[0]
+    distances = experimental.lag_distance[np.isfinite(experimental.semivariance)]
+
+    len_scale = gstools_len_scale_from_practical_range(fit.model, fit.range_value)
+    gstools_model = getattr(gs, fit.model.replace(" ", ""))(
+        dim=2,
+        var=fit.variance,
+        len_scale=len_scale,
+        nugget=fit.nugget,
+    )
+
+    assert np.allclose(
+        evaluate_variogram_model(fit.model, distances, fit.range_value, fit.variance, fit.nugget),
+        gstools_model.variogram(distances),
+        rtol=1e-8,
+        atol=1e-10,
+    )
 
 
 def test_validation_metrics_and_residual_sign():

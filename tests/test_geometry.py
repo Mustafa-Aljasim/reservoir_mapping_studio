@@ -8,8 +8,16 @@ import pandas as pd
 import shapefile
 from shapely.geometry import LineString, Polygon
 
+from core.active_data import PANEL_MODE_COMBINED, PANEL_MODE_INDEPENDENT, prepare_active_property_data
 from core.geometry.assignment import assign_points_to_polygons, outside_panel_count
-from core.geometry.compartment import compartment_interpolate
+from core.geometry.compartment import (
+    assign_prepared_observations_to_panels,
+    assert_independent_panels_do_not_overlap,
+    compartment_interpolate,
+    filter_dataframe_to_selected_panels,
+    panel_domain_keep_mask,
+    selected_panel_union,
+)
 from core.geometry.loader import (
     _polygonize_closed_linework,
     get_zipped_shapefile_candidates,
@@ -19,6 +27,7 @@ from core.geometry.loader import (
 from core.geometry.masking import polygon_keep_mask
 from core.geometry.models import GeometryFeature, GeometryLayer
 from core.geometry.validation import detect_polygon_overlaps, validate_geometry_layer
+from core.geostatistics.validation import leave_one_out_cross_validation
 
 
 def _two_panel_layer() -> GeometryLayer:
@@ -111,6 +120,157 @@ def test_compartment_interpolation_uses_own_observations():
     assert result.surface[0, 1] < 2800
     assert result.panel_grid[0, 0] == "A"
     assert result.panel_grid[0, 1] == "B"
+
+
+def test_one_selected_panel_uses_only_that_panel_observations():
+    df = pd.DataFrame(
+        {
+            "X": [0.2, 0.8, 1.2, 1.8],
+            "Y": [0.2, 0.8, 0.2, 0.8],
+            "Panel": ["A", "A", "B", "B"],
+            "Net_Sand": [10.0, 12.0, 30.0, 32.0],
+        }
+    )
+    active = prepare_active_property_data(
+        df,
+        {"x": "X", "y": "Y", "panel": "Panel"},
+        "Net_Sand",
+        "Generic",
+        selected_panels=["A"],
+    )
+    spatial = filter_dataframe_to_selected_panels(df, "X", "Y", _two_panel_layer(), ["A"])
+
+    assert set(active.dataframe["Panel"]) == {"A"}
+    assert set(spatial["Panel"]) == {"A"}
+
+
+def test_combined_selected_panels_pool_observations_and_union_domain():
+    df = pd.DataFrame(
+        {
+            "X": [0.2, 0.8, 1.2, 1.8],
+            "Y": [0.2, 0.8, 0.2, 0.8],
+            "Panel": ["A", "A", "B", "B"],
+            "Net_Sand": [10.0, 12.0, 30.0, 32.0],
+        }
+    )
+    active = prepare_active_property_data(
+        df,
+        {"x": "X", "y": "Y", "panel": "Panel"},
+        "Net_Sand",
+        "Generic",
+        selected_panels=["A", "B"],
+    )
+    union = selected_panel_union(_two_panel_layer(), ["A", "B"])
+    grid_x = np.array([[0.5, 1.5, 2.5]])
+    grid_y = np.array([[0.5, 0.5, 0.5]])
+    keep = panel_domain_keep_mask(_two_panel_layer(), ["A", "B"], grid_x, grid_y)
+
+    assert PANEL_MODE_COMBINED == "Combined Selected Panels"
+    assert set(active.dataframe["Panel"]) == {"A", "B"}
+    assert len(active.dataframe) == 4
+    assert np.isclose(union.area, 2.0)
+    assert keep.tolist() == [[True, True, False]]
+
+
+def test_all_selected_panels_combined_keeps_all_panel_observations():
+    df = pd.DataFrame(
+        {
+            "X": [0.2, 0.8, 1.2, 1.8],
+            "Y": [0.2, 0.8, 0.2, 0.8],
+            "Panel": ["A", "A", "B", "B"],
+            "Net_Sand": [10.0, 12.0, 30.0, 32.0],
+        }
+    )
+    active = prepare_active_property_data(
+        df,
+        {"x": "X", "y": "Y", "panel": "Panel"},
+        "Net_Sand",
+        "Generic",
+        selected_panels=["A", "B"],
+    )
+
+    assert active.selected_panels == ("A", "B")
+    assert len(active.dataframe) == len(df)
+
+
+def test_independent_panel_mode_blocks_overlapping_polygons():
+    layer = GeometryLayer(
+        name="Overlap",
+        layer_type="Panel / Compartment",
+        features=[
+            GeometryFeature(Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]), "Panel / Compartment", "A"),
+            GeometryFeature(Polygon([(1, 0), (3, 0), (3, 1), (1, 1)]), "Panel / Compartment", "B"),
+        ],
+    )
+
+    try:
+        assert_independent_panels_do_not_overlap(layer, ["A", "B"])
+        raise AssertionError("Expected overlap validation error")
+    except ValueError as exc:
+        assert "Selected panel polygons overlap" in str(exc)
+
+
+def test_boundary_observation_is_not_duplicated_without_explicit_panel_label():
+    prepared = pd.DataFrame(
+        {
+            "X": [1.0, 0.5, 1.5],
+            "Y": [0.5, 0.5, 0.5],
+            "Z": [20.0, 10.0, 30.0],
+        }
+    )
+    labels, warnings = assign_prepared_observations_to_panels(prepared, _two_panel_layer(), ["A", "B"])
+
+    assert labels.tolist() == [None, "A", "B"]
+    assert len(warnings) == 1
+
+
+def test_explicit_panel_label_resolves_boundary_observation_deterministically():
+    prepared = pd.DataFrame(
+        {
+            "X": [1.0, 1.0],
+            "Y": [0.5, 0.5],
+            "Z": [20.0, 21.0],
+            "Panel": ["A", "B"],
+        }
+    )
+    labels, warnings = assign_prepared_observations_to_panels(
+        prepared,
+        _two_panel_layer(),
+        ["A", "B"],
+        dataset_panel_col="Panel",
+    )
+
+    assert labels.tolist() == ["A", "B"]
+    assert warnings == []
+
+
+def test_loocv_combined_can_borrow_selected_panel_data_but_independent_cannot():
+    prepared = pd.DataFrame(
+        {
+            "X": [0.2, 1.2, 1.8, 1.5],
+            "Y": [0.5, 0.2, 0.5, 0.8],
+            "Z": [100.0, 300.0, 310.0, 305.0],
+        }
+    )
+    panels = ["A", "B", "B", "B"]
+    combined, _ = leave_one_out_cross_validation(
+        prepared,
+        "IDW",
+        {"power": 2.0, "neighbors": 3, "min_neighbors": 1},
+        panels=panels,
+        respect_compartments=False,
+    )
+    independent, _ = leave_one_out_cross_validation(
+        prepared,
+        "IDW",
+        {"power": 2.0, "neighbors": 3, "min_neighbors": 1},
+        panels=panels,
+        respect_compartments=True,
+    )
+
+    assert PANEL_MODE_INDEPENDENT == "Independent by Panel / Compartment"
+    assert np.isfinite(combined.loc[0, "Predicted"])
+    assert np.isnan(independent.loc[0, "Predicted"])
 
 
 def _write_shapefile_bundle(tmp_path: Path, name: str, records: list[tuple[str, list[tuple[float, float]]]]) -> bytes:

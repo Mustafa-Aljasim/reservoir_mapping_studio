@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import cKDTree
 
+from core.geostatistics.variogram import gstools_len_scale_from_practical_range
 from utils.validators import non_collinear_points
 
 
@@ -50,7 +51,7 @@ def _gstools_model(
     kwargs = {
         "dim": 2,
         "var": float(max(variance, 1e-12)),
-        "len_scale": float(max(range_value, 1e-12)),
+        "len_scale": gstools_len_scale_from_practical_range(model_name, float(max(range_value, 1e-12))),
         "nugget": float(max(nugget, 0.0)),
     }
     if anisotropy_enabled:
@@ -144,4 +145,3 @@ def kriging_predict_point(x, y, z, point_x: float, point_y: float, parameters: d
     grid_y = np.asarray([[point_y]], dtype=float)
     result = ordinary_kriging_interpolate(x, y, z, grid_x, grid_y, parameters or {})
     return float(result.estimate[0, 0]), float(result.variance[0, 0])
-

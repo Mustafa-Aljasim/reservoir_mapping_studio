@@ -2,28 +2,36 @@
 
 from __future__ import annotations
 
-from datetime import date
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from core.active_data import build_model_signature, prepare_active_property_data, respect_compartments_from_mode
 from core.column_mapper import numeric_property_candidates
-from core.crs import EPSG_CRS_MODE
 from core.data_qc import (
     build_qc_summary,
     descriptive_statistics,
     flag_outliers,
     prepare_interpolation_dataframe,
 )
-from core.geometry.assignment import assign_points_to_polygons, outside_panel_count
 from core.filtering import build_filter_column_list
+from core.geometry.assignment import assign_points_to_polygons, outside_panel_count
+from core.geometry.compartment import (
+    compartment_interpolate,
+    filter_dataframe_to_selected_panels,
+    panel_domain_keep_mask,
+    selected_panel_bounds,
+    selected_panel_features,
+)
 from core.grid import generate_grid
-from core.geometry.compartment import compartment_interpolate
 from core.geometry.masking import layer_keep_mask, polygon_union
 from core.geometry.models import GeometryLayer
-from core.geostatistics.variogram import compute_experimental_variogram, fit_candidate_models
+from core.geostatistics.variogram import (
+    VARIOGRAM_RANGE_CONVENTION,
+    compute_experimental_variogram,
+    fit_candidate_models,
+)
 from core.interpolation import InterpolationError, interpolate_surface_result
 from core.interpolation.rbf import estimate_epsilon
 from core.map_context import build_default_map_title, build_map_metadata
@@ -37,7 +45,6 @@ from core.masking import (
 from core.pressure_dates import (
     format_map_date,
     summarize_measurement_dates,
-    validate_date_column,
 )
 from core.plotting.map_builder import build_map_figure, move_observation_traces_to_top
 from core.plotting.geometry_layers import add_fault_layer, add_polygon_layer
@@ -56,6 +63,9 @@ from pages.shared import (
     ensure_session_state,
     get_current_filtered_data,
     mark_project_dirty,
+    panel_interpolation_mode_control,
+    panel_selection_control,
+    pressure_reference_date_control,
     render_filter_controls,
     unit_input,
     update_include_state_from_editor,
@@ -224,56 +234,6 @@ def render_static_image_exports(figure, base_name: str) -> None:
             button_cols[2].download_button("Download PDF", exports["pdf"], f"{exports['base_name']}.pdf", "application/pdf")
 
 
-def pressure_reference_date_control(
-    df: pd.DataFrame,
-    mappings: dict[str, str | None],
-) -> tuple[date | None, object | None]:
-    reference_col = mappings.get("map_reference_date")
-    validation = None
-    detected_common_date = None
-    available_dates: list[date] = []
-    if reference_col and reference_col in df.columns:
-        validation = validate_date_column(df[reference_col])
-        available_dates = list(validation.unique_dates)
-        detected_common_date = validation.common_date
-        if detected_common_date:
-            st.caption(f"Detected common Pressure Map Reference Date: {format_map_date(detected_common_date)}")
-        elif validation.has_multiple_dates:
-            st.caption(
-                "Multiple Pressure Map Reference Dates are present in the active dataset. Select the date to use for this map."
-            )
-        if validation.failed_count:
-            st.warning(f"{validation.failed_count} pressure map reference date value(s) could not be parsed.")
-
-        if available_dates:
-            current_reference_date = st.session_state.get("pressure_reference_date")
-            if current_reference_date not in available_dates:
-                current_reference_date = available_dates[0]
-            if len(available_dates) == 1:
-                selected_reference_date = available_dates[0]
-            else:
-                selected_reference_date = st.selectbox(
-                    "Pressure Map Reference Date",
-                    available_dates,
-                    index=available_dates.index(current_reference_date),
-                    format_func=format_map_date,
-                    key="pressure_reference_date_input",
-                    help="Select the prepared pressure-map reference date for the active interpolation. Original measurement dates remain metadata only.",
-                )
-            st.session_state.pressure_reference_date = selected_reference_date
-            return selected_reference_date, validation
-
-    current_reference_date = st.session_state.get("pressure_reference_date") or detected_common_date or date.today()
-    selected_reference_date = st.date_input(
-        "Pressure Map Reference Date",
-        value=current_reference_date,
-        key="pressure_reference_date_input",
-        help="A single reference date represented by the supplied pressure values. No temporal extrapolation is performed.",
-    )
-    st.session_state.pressure_reference_date = selected_reference_date
-    return selected_reference_date, validation
-
-
 def method_parameter_controls(
     method: str,
     prepared: pd.DataFrame,
@@ -428,6 +388,7 @@ def method_parameter_controls(
         return {
             "variogram_model": model,
             "variogram_mode": variogram_mode,
+            "variogram_range_convention": VARIOGRAM_RANGE_CONVENTION,
             "range": range_value,
             "variance": variance,
             "nugget": nugget,
@@ -623,6 +584,13 @@ with st.sidebar:
     )
     st.header("Filters")
     filtered_base = render_filter_controls(df, mappings, "mapping_studio")
+    if panel_layer is not None and panel_layer.polygon_features:
+        st.header("Panels")
+        selected_panels = panel_selection_control(panel_layer, "mapping_selected_panels")
+        panel_interpolation_mode = panel_interpolation_mode_control(True, "mapping_panel_interpolation_mode")
+    else:
+        selected_panels = []
+        panel_interpolation_mode = panel_interpolation_mode_control(False, "mapping_panel_interpolation_mode")
     layer_settings = render_layer_manager()
 
 property_options = numeric_property_candidates(df, mappings)
@@ -670,20 +638,33 @@ with top_cols[4]:
     st.metric("Filtered Rows", f"{len(filtered_base):,}")
 
 is_pressure_map = property_type == "Pressure"
-filtered = get_current_filtered_data()
-filtered = flag_outliers(filtered, property_col)
 pressure_reference_date = None
 reference_validation = None
+pre_pressure_filtered = get_current_filtered_data()
 if is_pressure_map:
     st.info(
         "Pressure values should already be prepared/extrapolated to the map reference date before import. "
         "Reservoir Mapping Studio performs spatial interpolation only."
     )
-    pressure_reference_date, reference_validation = pressure_reference_date_control(filtered, mappings)
-    reference_col = mappings.get("map_reference_date")
-    if reference_col and reference_col in filtered.columns and pressure_reference_date is not None:
-        reference_mask = pd.to_datetime(filtered[reference_col], errors="coerce").dt.date.eq(pressure_reference_date)
-        filtered = filtered.loc[reference_mask].copy()
+    pressure_reference_date, reference_validation = pressure_reference_date_control(
+        pre_pressure_filtered,
+        mappings,
+        "mapping_pressure_reference_date_input",
+    )
+
+active_data = prepare_active_property_data(
+    df,
+    mappings,
+    property_col,
+    property_type,
+    pressure_reference_date,
+    st.session_state.get("filter_values", {}),
+    selected_panels if panel_layer is not None else None,
+)
+filtered = flag_outliers(active_data.dataframe, property_col)
+if selected_panels and panel_layer is not None and not mappings.get("panel"):
+    filtered = filter_dataframe_to_selected_panels(filtered, x_col, y_col, panel_layer, selected_panels)
+pressure_reference_date = active_data.pressure_reference_date
 
 filtered_with_include = attach_include_column(filtered)
 
@@ -890,18 +871,17 @@ with interpolation_tab:
         property_col,
         include_col=INCLUDE_COLUMN,
         duplicate_method=duplicate_method,
+        metadata_columns=[column for column in [well_col, mappings.get("panel")] if column],
+        row_id_col=INTERNAL_ROW_ID,
     )
     grid_parameters = grid_controls()
     method = st.radio("Interpolation Method", INTERPOLATION_METHODS, horizontal=True, index=0)
-    respect_compartments = False
+    respect_compartments = respect_compartments_from_mode(panel_interpolation_mode)
     if panel_layer is not None and panel_layer.polygon_features:
-        respect_compartments = st.checkbox(
-            "Respect Panel / Compartment Boundaries",
-            value=False,
-            help="When enabled, interpolation is performed separately inside each active panel polygon.",
-        )
         if respect_compartments:
-            st.caption("Observations outside all active panel polygons are excluded from compartment-specific interpolation.")
+            st.caption("Independent mode: each selected panel is interpolated from its own assigned observations.")
+        else:
+            st.caption("Combined mode: selected panel observations are pooled into one interpolation model.")
     method_parameters = method_parameter_controls(
         method,
         prepared,
@@ -916,6 +896,9 @@ with interpolation_tab:
     domain_options = ["Well Data Extent"]
     if reservoir_boundary_layer is not None and reservoir_boundary_layer.polygon_features:
         domain_options.append("Reservoir Boundary Extent")
+    selected_panel_domain_bounds = selected_panel_bounds(panel_layer, selected_panels)
+    if selected_panel_domain_bounds is not None:
+        domain_options.append("Selected Panel Extent")
     interpolation_domain = st.radio(
         "Interpolation Domain",
         domain_options,
@@ -923,9 +906,15 @@ with interpolation_tab:
         horizontal=True,
     )
     reservoir_geometry = polygon_union(reservoir_boundary_layer.polygon_features) if reservoir_boundary_layer else None
-    domain_bounds = tuple(float(value) for value in reservoir_geometry.bounds) if interpolation_domain == "Reservoir Boundary Extent" and reservoir_geometry else None
+    domain_bounds = None
+    if interpolation_domain == "Reservoir Boundary Extent" and reservoir_geometry:
+        domain_bounds = tuple(float(value) for value in reservoir_geometry.bounds)
+    elif interpolation_domain == "Selected Panel Extent":
+        domain_bounds = selected_panel_domain_bounds
     if interpolation_domain == "Reservoir Boundary Extent" and reservoir_geometry is not None:
         st.caption("The full rectangular reservoir bounding box will be interpolated before any polygon mask is applied.")
+    if interpolation_domain == "Selected Panel Extent":
+        st.caption("The selected panel union bounds will be interpolated before panel or reservoir masks are applied.")
     if method in {"Linear", "Cubic"} and interpolation_domain == "Reservoir Boundary Extent":
         st.info("Linear and Cubic interpolation may remain NaN outside the convex hull of the observations.")
     st.caption(f"{len(prepared):,} finite included observation(s) will participate after duplicate handling.")
@@ -957,6 +946,8 @@ with interpolation_tab:
                             method,
                             method_parameters,
                             min_observations=max(3, int(method_parameters.get("min_neighbors", 3))),
+                            selected_panels=selected_panels,
+                            dataset_panel_col=mappings.get("panel"),
                         )
                         grid_z, grid_variance, mask_info = apply_surface_masks(
                             compartment_result.surface,
@@ -993,6 +984,12 @@ with interpolation_tab:
                             )
                             mask_info["masked_cells"] = geometry_mask_info["masked_cells"]
                             mask_info["valid_grid_cells"] = geometry_mask_info["valid_grid_cells"]
+                        if panel_layer is not None and selected_panels:
+                            panel_keep = panel_domain_keep_mask(panel_layer, selected_panels, grid_x, grid_y)
+                            grid_z = apply_keep_mask(grid_z, panel_keep)
+                            grid_variance = apply_keep_mask(grid_variance, panel_keep) if grid_variance is not None else None
+                            mask_info["panel_domain_masked_cells"] = int((~panel_keep).sum())
+                            mask_info["valid_grid_cells"] = int(np.isfinite(grid_z).sum())
                         mask_info["panel_constraint"] = False
                         panel_grid = None
                 generated_included = filtered_with_include[filtered_with_include[INCLUDE_COLUMN]].copy()
@@ -1004,6 +1001,49 @@ with interpolation_tab:
                     is_pressure_map=is_pressure_map,
                     map_reference_date=pressure_reference_date,
                 )
+                selected_panel_names = list(active_data.selected_panels or tuple(selected_panels))
+                selected_layer_names = list(active_data.selected_layers)
+                model_signature = build_model_signature(
+                    property_column=property_col,
+                    property_type=property_type,
+                    pressure_reference_date=pressure_reference_date,
+                    selected_panels=selected_panel_names,
+                    selected_layers=selected_layer_names,
+                    panel_interpolation_mode=panel_interpolation_mode,
+                    filter_values=st.session_state.get("filter_values", {}),
+                    active_dataframe=filtered_with_include,
+                    duplicate_method=duplicate_method,
+                    interpolation_method=method,
+                    interpolation_parameters=method_parameters,
+                    variogram={
+                        "model": method_parameters.get("variogram_model"),
+                        "range": method_parameters.get("range"),
+                        "variance": method_parameters.get("variance"),
+                        "nugget": method_parameters.get("nugget"),
+                        "range_convention": method_parameters.get("variogram_range_convention"),
+                    }
+                    if method == "Ordinary Kriging"
+                    else {},
+                    anisotropy={
+                        "enabled": method_parameters.get("anisotropy_enabled", False),
+                        "angle": method_parameters.get("anisotropy_angle", 0.0),
+                        "ratio": method_parameters.get("anisotropy_ratio", 1.0),
+                    },
+                )
+                selected_features = selected_panel_features(panel_layer, selected_panel_names)
+                geometry_references = {
+                    "reservoir_boundary_name": reservoir_boundary_layer.name if reservoir_boundary_layer else "",
+                    "reservoir_boundary_source": reservoir_boundary_layer.source_name if reservoir_boundary_layer else "",
+                    "reservoir_boundary_bounds": tuple(float(value) for value in reservoir_geometry.bounds)
+                    if reservoir_geometry is not None
+                    else None,
+                    "panel_layer_name": panel_layer.name if panel_layer else "",
+                    "panel_layer_source": panel_layer.source_name if panel_layer else "",
+                    "selected_panel_names": selected_panel_names,
+                    "selected_panel_bounds": selected_panel_domain_bounds,
+                    "selected_panel_feature_count": len(selected_features),
+                    "panel_interpolation_mode": panel_interpolation_mode,
+                }
                 export_metadata = build_map_metadata(
                     property_col,
                     unit,
@@ -1020,12 +1060,21 @@ with interpolation_tab:
                     geometry_context={
                         "reservoir_boundary_used": "Reservoir Boundary" in mask_parameters.get("mode", ""),
                         "panel_constraint_used": respect_compartments,
-                        "active_panels": ", ".join(feature.name for feature in panel_layer.polygon_features)
-                        if panel_layer is not None
-                        else "",
+                        "active_panels": ", ".join(selected_panel_names),
                         "fault_layer_loaded": fault_layer is not None,
                         "custom_layer_count": len(custom_layers),
+                        **geometry_references,
                     },
+                    property_type=property_type,
+                    crs=st.session_state.get("crs", {}),
+                    selected_panels=selected_panel_names,
+                    selected_layers=selected_layer_names,
+                    panel_interpolation_mode=panel_interpolation_mode,
+                    interpolation_domain=interpolation_domain,
+                    domain_bounds=domain_bounds,
+                    grid_x=grid_x,
+                    grid_y=grid_y,
+                    model_signature_hash=model_signature["hash"],
                 )
                 st.session_state.generated_map = {
                     "grid_x": grid_x,
@@ -1042,6 +1091,7 @@ with interpolation_tab:
                     "well_col": well_col,
                     "coordinate_unit": coordinate_unit,
                     "is_pressure_map": is_pressure_map,
+                    "property_type": property_type,
                     "map_reference_date": pressure_reference_date,
                     "measurement_date_col": mappings.get("measurement_date"),
                     "map_reference_date_col": mappings.get("map_reference_date"),
@@ -1053,16 +1103,22 @@ with interpolation_tab:
                     "domain_bounds": domain_bounds,
                     "mask_info": mask_info,
                     "respect_compartments": respect_compartments,
+                    "panel_interpolation_mode": panel_interpolation_mode,
+                    "selected_panels": selected_panel_names,
+                    "selected_layers": selected_layer_names,
                     "geometry_context": {
                         "reservoir_boundary_loaded": reservoir_boundary_layer is not None,
                         "panel_layer_loaded": panel_layer is not None,
                         "fault_layer_loaded": fault_layer is not None,
                         "custom_layer_count": len(custom_layers),
+                        **geometry_references,
                     },
+                    "geometry_references": geometry_references,
                     "duplicate_method": duplicate_method,
                     "hover_columns": generated_hover_columns(mappings),
                     "title": title,
                     "export_metadata": export_metadata,
+                    "model_signature": model_signature,
                 }
                 st.success("Map generated.")
                 for warning in mask_info.get("compartment_warnings", []):
@@ -1242,7 +1298,9 @@ with map_tab:
         if generated.get("is_pressure_map") and generated.get("map_reference_date"):
             st.metric("Pressure Map Reference Date", format_map_date(generated.get("map_reference_date")))
         if generated.get("respect_compartments"):
-            st.caption("Panel / compartment constraint: enabled. Each active panel was interpolated from its own observations.")
+            st.caption("Panel Interpolation Mode: Independent by Panel / Compartment.")
+        elif generated.get("selected_panels"):
+            st.caption("Panel Interpolation Mode: Combined Selected Panels.")
 
         with st.expander("Spatial Domain Diagnostics", expanded=False):
             def _extent_text(extent):
@@ -1357,23 +1415,23 @@ with map_tab:
 
 with export_tab:
     st.markdown("#### Export")
-    current_for_export = attach_include_column(get_current_filtered_data())
+    current_for_export = filtered_with_include.copy()
     included_for_export = current_for_export[current_for_export[INCLUDE_COLUMN]].copy()
     export_clean = drop_internal_columns(included_for_export)
     export_cols = st.columns(2)
     with export_cols[0]:
         st.download_button(
-            "Download Filtered Observations CSV",
+            "Download Active Map Observations CSV",
             dataframe_to_csv_bytes(export_clean),
-            file_name="filtered_observations.csv",
+            file_name="active_map_observations.csv",
             mime="text/csv",
             width="stretch",
         )
     with export_cols[1]:
         st.download_button(
-            "Download Filtered Observations Excel",
-            dataframe_to_excel_bytes(export_clean, "Filtered Observations"),
-            file_name="filtered_observations.xlsx",
+            "Download Active Map Observations Excel",
+            dataframe_to_excel_bytes(export_clean, "Active Observations"),
+            file_name="active_map_observations.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             width="stretch",
         )
@@ -1397,12 +1455,22 @@ with export_tab:
             geometry_context={
                 "reservoir_boundary_used": "Reservoir Boundary" in generated["mask_parameters"].get("mode", ""),
                 "panel_constraint_used": bool(generated.get("respect_compartments")),
-                "active_panels": ", ".join(feature.name for feature in panel_layer.polygon_features)
-                if panel_layer is not None
-                else "",
+                "active_panels": ", ".join(str(value) for value in generated.get("selected_panels", [])),
                 "fault_layer_loaded": fault_layer is not None,
                 "custom_layer_count": len(custom_layers),
+                **(generated.get("geometry_references", {}) or {}),
             },
+            property_type=generated.get("property_type") or ("Pressure" if generated.get("is_pressure_map") else "Generic"),
+            crs=st.session_state.get("crs", {}),
+            selected_panels=generated.get("selected_panels", []),
+            selected_layers=generated.get("selected_layers", []),
+            panel_interpolation_mode=generated.get("panel_interpolation_mode"),
+            interpolation_domain=generated.get("interpolation_domain"),
+            domain_bounds=generated.get("domain_bounds"),
+            grid_x=generated.get("grid_x"),
+            grid_y=generated.get("grid_y"),
+            validation_metrics=generated.get("validation_metrics", {}),
+            model_signature_hash=(generated.get("model_signature") or {}).get("hash", ""),
         )
         metadata_summary = [
             f"Property: {generated['property_col']}",

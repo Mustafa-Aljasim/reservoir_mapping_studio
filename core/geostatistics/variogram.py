@@ -11,6 +11,8 @@ from scipy.spatial.distance import pdist
 
 
 VARIOGRAM_MODELS = ("Spherical", "Exponential", "Gaussian")
+VARIOGRAM_RANGE_CONVENTION = "Practical Range"
+PRACTICAL_RANGE_EXPONENT = 3.0
 
 
 @dataclass(frozen=True)
@@ -96,13 +98,27 @@ def spherical_model(h, range_value, variance, nugget):
 
 
 def exponential_model(h, range_value, variance, nugget):
+    """Exponential semivariogram using user-facing practical range.
+
+    Practical range is the distance where this model reaches approximately
+    95 percent of the partial sill.
+    """
+
     h = np.asarray(h, dtype=float)
-    return nugget + variance * (1.0 - np.exp(-3.0 * h / max(range_value, 1e-12)))
+    return nugget + variance * (1.0 - np.exp(-PRACTICAL_RANGE_EXPONENT * h / max(range_value, 1e-12)))
 
 
 def gaussian_model(h, range_value, variance, nugget):
+    """Gaussian semivariogram using user-facing practical range.
+
+    Practical range is the distance where this model reaches approximately
+    95 percent of the partial sill.
+    """
+
     h = np.asarray(h, dtype=float)
-    return nugget + variance * (1.0 - np.exp(-3.0 * (h / max(range_value, 1e-12)) ** 2))
+    return nugget + variance * (
+        1.0 - np.exp(-PRACTICAL_RANGE_EXPONENT * (h / max(range_value, 1e-12)) ** 2)
+    )
 
 
 MODEL_FUNCTIONS = {
@@ -116,6 +132,35 @@ def evaluate_variogram_model(model: str, lag_distance, range_value: float, varia
     if model not in MODEL_FUNCTIONS:
         raise ValueError(f"Unsupported variogram model: {model}")
     return MODEL_FUNCTIONS[model](lag_distance, range_value, variance, nugget)
+
+
+def gstools_len_scale_from_practical_range(model: str, practical_range: float) -> float:
+    """Convert user-facing practical range to GSTools ``len_scale``.
+
+    V1 uses practical range in the UI, fitted parameters, saved scenarios, and
+    exports. GSTools expects model-specific length scales, so Ordinary Kriging
+    must convert explicitly before constructing the covariance model.
+    """
+
+    value = float(max(practical_range, 1e-12))
+    if model == "Spherical":
+        return value
+    if model == "Exponential":
+        return value / PRACTICAL_RANGE_EXPONENT
+    if model == "Gaussian":
+        return value * float(np.sqrt(np.pi / (4.0 * PRACTICAL_RANGE_EXPONENT)))
+    raise ValueError(f"Unsupported variogram model: {model}")
+
+
+def practical_range_from_gstools_len_scale(model: str, len_scale: float) -> float:
+    value = float(max(len_scale, 1e-12))
+    if model == "Spherical":
+        return value
+    if model == "Exponential":
+        return value * PRACTICAL_RANGE_EXPONENT
+    if model == "Gaussian":
+        return value * float(np.sqrt((4.0 * PRACTICAL_RANGE_EXPONENT) / np.pi))
+    raise ValueError(f"Unsupported variogram model: {model}")
 
 
 def fit_variogram_model(experimental: ExperimentalVariogram, model: str) -> VariogramFit:
