@@ -30,6 +30,7 @@ from utils.constants import (
 )
 from core.crs import LOCAL_CRS_MODE, local_crs
 from core.geometry.compartment import panel_feature_names
+from core.layer_mapping import LAYER_MAPPING_SCOPES, LAYER_SCOPE_ALL, LAYER_SCOPE_SELECTED
 from core.pressure_dates import format_map_date, validate_date_column
 from utils.units import coordinate_unit_key_from_label, coordinate_unit_label, coordinate_unit_labels
 
@@ -62,6 +63,12 @@ def ensure_session_state() -> None:
         "pressure_reference_date": None,
         "selected_panels": [],
         "panel_interpolation_mode": PANEL_MODE_COMBINED,
+        "layer_mapping_scope": "Selected Layer",
+        "selected_reservoir_layer": None,
+        "active_generated_layer": None,
+        "generated_layer_maps": {},
+        "generated_layer_statuses": [],
+        "generated_layer_batch_signature": {},
         "geometry_layers": {
             "reservoir_boundary": None,
             "panels": None,
@@ -138,6 +145,12 @@ def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | N
     st.session_state.pressure_reference_date = None
     st.session_state.selected_panels = []
     st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
+    st.session_state.layer_mapping_scope = "Selected Layer"
+    st.session_state.selected_reservoir_layer = None
+    st.session_state.active_generated_layer = None
+    st.session_state.generated_layer_maps = {}
+    st.session_state.generated_layer_statuses = []
+    st.session_state.generated_layer_batch_signature = {}
     st.session_state.current_property = None
     st.session_state.include_state = {}
     st.session_state.generated_map = None
@@ -182,6 +195,12 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
     st.session_state.pressure_reference_date = None
     st.session_state.selected_panels = []
     st.session_state.panel_interpolation_mode = PANEL_MODE_COMBINED
+    st.session_state.layer_mapping_scope = "Selected Layer"
+    st.session_state.selected_reservoir_layer = None
+    st.session_state.active_generated_layer = None
+    st.session_state.generated_layer_maps = {}
+    st.session_state.generated_layer_statuses = []
+    st.session_state.generated_layer_batch_signature = {}
     st.session_state.geometry_layers = {
         "reservoir_boundary": None,
         "panels": None,
@@ -245,15 +264,25 @@ def render_filter_controls(
     mappings: dict[str, str | None],
     key_prefix: str,
     include_additional: bool = True,
+    exclude_semantic_keys: tuple[str, ...] | list[str] | set[str] = (),
 ) -> pd.DataFrame:
     additional = st.session_state.get("additional_filter_columns", []) if include_additional else []
-    filter_columns = build_filter_column_list(mappings, additional)
+    filter_columns = build_filter_column_list(mappings, additional, exclude_semantic_keys)
+    excluded_columns = {
+        mappings.get(key)
+        for key in (exclude_semantic_keys or ())
+        if mappings.get(key)
+    }
 
     if not filter_columns:
         st.caption("No mapped metadata filters are available.")
         return df.copy()
 
-    filter_values = dict(st.session_state.get("filter_values", {}))
+    filter_values = {
+        column: selected
+        for column, selected in dict(st.session_state.get("filter_values", {})).items()
+        if column not in excluded_columns
+    }
     prior_columns: list[str] = []
     for label, column in filter_columns:
         if column not in df.columns:
@@ -453,6 +482,42 @@ def panel_interpolation_mode_control(
         help="Combined pools selected panels into one interpolation model. Independent treats selected panels as separated compartments.",
     )
     st.session_state.panel_interpolation_mode = selected
+    return selected
+
+
+def layer_mapping_scope_control(has_layer_column: bool, key: str = "layer_mapping_scope") -> str:
+    if not has_layer_column:
+        st.session_state.layer_mapping_scope = LAYER_SCOPE_SELECTED
+        return LAYER_SCOPE_SELECTED
+    current = st.session_state.get("layer_mapping_scope", LAYER_SCOPE_SELECTED)
+    if current not in LAYER_MAPPING_SCOPES:
+        current = LAYER_SCOPE_SELECTED
+    selected = st.radio(
+        "Layer Mapping Scope",
+        LAYER_MAPPING_SCOPES,
+        index=LAYER_MAPPING_SCOPES.index(current),
+        horizontal=True,
+        key=key,
+        help="Selected Layer generates one map. All Layers generates one independent map per reservoir layer.",
+    )
+    st.session_state.layer_mapping_scope = selected
+    return selected
+
+
+def reservoir_layer_control(options: list[str], key: str = "selected_reservoir_layer") -> str | None:
+    if not options:
+        st.session_state.selected_reservoir_layer = None
+        return None
+    current = st.session_state.get("selected_reservoir_layer")
+    if current not in options:
+        current = options[0]
+    selected = st.selectbox(
+        "Reservoir Layer",
+        options,
+        index=options.index(current),
+        key=key,
+    )
+    st.session_state.selected_reservoir_layer = selected
     return selected
 
 

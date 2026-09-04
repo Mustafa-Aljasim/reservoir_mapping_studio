@@ -61,8 +61,14 @@ def options_for_column(
 def build_filter_column_list(
     mappings: dict[str, str | None],
     additional_columns: list[str] | None = None,
+    exclude_semantic_keys: tuple[str, ...] | list[str] | set[str] = (),
 ) -> list[tuple[str, str]]:
-    columns = mapped_filter_columns(mappings)
+    excluded_columns = {mappings.get(key) for key in (exclude_semantic_keys or ()) if mappings.get(key)}
+    columns = [
+        (label, column)
+        for label, column in mapped_filter_columns(mappings)
+        if column not in excluded_columns
+    ]
     seen = {column for _, column in columns}
     for column in additional_columns or []:
         if column and column not in seen and column != INTERNAL_ROW_ID:

@@ -56,6 +56,8 @@ def build_map_metadata(
     grid_y=None,
     validation_metrics: dict[str, object] | None = None,
     model_signature_hash: str | None = None,
+    reservoir_layer: str | None = None,
+    layer_mapping_scope: str | None = None,
 ) -> dict[str, object]:
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
     metadata: dict[str, object] = {
@@ -77,6 +79,8 @@ def build_map_metadata(
         "Panel_Interpolation_Mode": panel_mode_from_legacy(panel_interpolation_mode, False),
         "Selected_Panels": ", ".join(str(value) for value in (selected_panels or [])),
         "Selected_Layers": ", ".join(str(value) for value in (selected_layers or [])),
+        "Reservoir_Layer": reservoir_layer or "",
+        "Layer_Mapping_Scope": layer_mapping_scope or "",
         "Variogram_Range_Convention": method_parameters.get("variogram_range_convention", "Practical Range")
         if interpolation_method == "Ordinary Kriging"
         else "",

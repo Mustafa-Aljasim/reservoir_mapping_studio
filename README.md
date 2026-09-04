@@ -1,6 +1,6 @@
 # Reservoir Mapping Studio
 
-Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic interpolation, panel-aware masking, Ordinary Kriging, geometry layers, project persistence, saved map scenarios, side-by-side map comparison, delta maps, and pressure-change workflows while keeping the app focused on engineering use rather than geoscience research tooling.
+Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic interpolation, panel-aware masking, Reservoir Layer selection, all-layer map batches, Ordinary Kriging, geometry layers, project persistence, saved map scenarios, side-by-side map comparison, delta maps, and pressure-change workflows while keeping the app focused on engineering use rather than geoscience research tooling.
 
 ## Installation
 
@@ -17,8 +17,8 @@ The main workspace includes:
 
 - Project: create a project, save/open `.rmsproj` archives, manage the dirty state, and maintain CRS metadata.
 - Data Manager: import CSV/Excel data, map columns, review QC, filters, and geometry.
-- Mapping Studio: generate maps, apply masks, configure units, run interpolation, style surfaces, and save map scenarios.
-- Geostatistics Lab: fit variograms, run cross validation, inspect residuals, and compare methods.
+- Mapping Studio: generate selected-layer maps or all-layer map batches, apply masks, configure units, run interpolation, style surfaces, and save map scenarios from a persistent controls/map workspace.
+- Geostatistics Lab: fit variograms, run cross validation, inspect residuals, and compare methods for the active Reservoir Layer.
 - Map Comparison: select two saved maps, align grids, compare them visually, and generate delta / pressure-change surfaces.
 
 ## Core V1 Workflow
@@ -30,7 +30,8 @@ Create Project
   -> Load well data
   -> Load geometry
   -> Map columns
-  -> Generate map
+  -> Choose Reservoir Layer scope
+  -> Generate selected layer or all layers
   -> Validate
   -> Save map scenario
   -> Generate second map
@@ -53,6 +54,7 @@ The archive stores:
 - filters and included/excluded states
 - geometry layers
 - interpolation settings
+- selected Reservoir Layer scope and generated layer maps
 - variogram settings
 - saved map scenarios
 - CRS metadata
@@ -62,6 +64,19 @@ This gives a reproducible engineering workspace without relying on Python pickle
 ## Saved Maps and Map Library
 
 Use the Map Library to save, rename, duplicate, delete, and reopen map scenarios. Each saved map keeps the computational definition of the generated surface, including the property, reference date, grid definition, interpolation method, mask details, geometry metadata, and style settings.
+
+## Reservoir Layers
+
+Reservoir Layer is an explicit mapping dimension, separate from metadata filters. A source column named `Zone` can still be mapped as `Layer`, but `Zone` is not a first-class semantic field in V1.
+
+Mapping Studio supports:
+
+- Selected Layer: generate one map for the selected reservoir layer.
+- All Layers: generate one independent map per active reservoir layer.
+- Layer map switching: switch among generated layer maps without recomputing interpolation.
+- Map status: generated maps show whether computational inputs are up to date or stale.
+
+Panel selection is applied before layer splitting. In combined panel mode, each layer map pools observations from the selected panels. In independent panel mode, each layer map respects panel/compartment boundaries.
 
 ## Map Comparison and Delta Maps
 
@@ -200,7 +215,7 @@ Interpolated grid exports include:
 - Kriging_StdDev where available
 - Panel where panel-constrained interpolation is active
 
-Excel grid export includes a `Map_Metadata` sheet with property, units, grid setup, duplicate handling, mask method, geometry context, custom layer count, kriging parameters, anisotropy settings, and distance/range units.
+Excel grid export includes a `Map_Metadata` sheet with property, units, grid setup, duplicate handling, mask method, Reservoir Layer scope, geometry context, custom layer count, kriging parameters, anisotropy settings, and distance/range units.
 
 Cross-validation results can be downloaded as CSV or Excel from the Geostatistics Lab.
 
@@ -225,7 +240,7 @@ python -m compileall .
 python -m pytest -q
 ```
 
-The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, and validation metrics.
+The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, stale map signatures, and project persistence.
 
 ## Current Limitations
 

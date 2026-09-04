@@ -36,6 +36,26 @@ def suggest_mappings(df: pd.DataFrame) -> dict[str, str | None]:
     return {key: suggest_column(df.columns, key) for key in SEMANTIC_FIELDS}
 
 
+def normalize_column_mappings(
+    mappings: dict[str, str | None] | None,
+    *,
+    migrate_zone_to_layer: bool = True,
+) -> dict[str, str | None]:
+    """Return current semantic mappings with legacy Zone handled safely.
+
+    Zone is no longer a first-class semantic field in V1. Older project files
+    may contain ``zone``; if no Layer is mapped, the legacy value is promoted to
+    Layer. Source columns named Zone are never removed from the dataframe.
+    """
+
+    mappings = mappings or {}
+    normalized = {key: value for key, value in mappings.items() if key in SEMANTIC_FIELDS}
+    legacy_zone = mappings.get("zone")
+    if migrate_zone_to_layer and legacy_zone and not normalized.get("layer"):
+        normalized["layer"] = legacy_zone
+    return normalized
+
+
 def is_numeric_like(series: pd.Series, threshold: float = 0.8) -> bool:
     if is_numeric_dtype(series):
         return True
@@ -80,4 +100,3 @@ def categorical_filter_candidates(
         if 1 <= unique_count <= max_unique:
             candidates.append(column)
     return candidates
-

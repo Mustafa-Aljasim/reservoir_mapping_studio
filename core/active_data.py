@@ -109,6 +109,18 @@ def _filter_selected_panel_column(
     return df[df[panel_col].astype(str).isin(selected)].copy()
 
 
+def _filter_selected_layer_column(
+    df: pd.DataFrame,
+    mappings: dict[str, str | None],
+    selected_layers: tuple[str, ...],
+) -> pd.DataFrame:
+    layer_col = mappings.get("layer")
+    if not selected_layers or not layer_col or layer_col not in df.columns:
+        return df.copy()
+    selected = set(selected_layers)
+    return df[df[layer_col].astype(str).isin(selected)].copy()
+
+
 def filter_pressure_reference_date(
     df: pd.DataFrame,
     mappings: dict[str, str | None],
@@ -133,6 +145,7 @@ def prepare_active_property_data(
     pressure_reference_date: Any = None,
     filter_values: dict[str, list[object]] | None = None,
     selected_panels: list[object] | tuple[object, ...] | None = None,
+    selected_layers: list[object] | tuple[object, ...] | None = None,
 ) -> ActivePropertyData:
     """Apply the V1 computational data sequence before duplicate handling.
 
@@ -148,6 +161,12 @@ def prepare_active_property_data(
         filtered = filtered.iloc[0:0].copy()
     elif selected_panel_tuple:
         filtered = _filter_selected_panel_column(filtered, mappings, selected_panel_tuple)
+    layer_selection_supplied = selected_layers is not None
+    selected_layer_tuple = tuple(str(value) for value in (selected_layers or ()) if value not in (None, ""))
+    if layer_selection_supplied and not selected_layer_tuple:
+        filtered = filtered.iloc[0:0].copy()
+    elif selected_layer_tuple:
+        filtered = _filter_selected_layer_column(filtered, mappings, selected_layer_tuple)
 
     resolved_reference_date = None
     if resolved_property_type == PROPERTY_TYPE_PRESSURE:
@@ -167,7 +186,9 @@ def prepare_active_property_data(
         selected_panels=selected_panel_tuple
         if panel_selection_supplied
         else selected_filter_values(mappings, filter_values, "panel"),
-        selected_layers=selected_filter_values(mappings, filter_values, "layer"),
+        selected_layers=selected_layer_tuple
+        if layer_selection_supplied
+        else selected_filter_values(mappings, filter_values, "layer"),
     )
 
 
@@ -215,6 +236,10 @@ def build_model_signature(
     duplicate_method: str | None = None,
     interpolation_method: str | None = None,
     interpolation_parameters: dict[str, Any] | None = None,
+    layer_mapping_scope: str | None = None,
+    interpolation_domain: str | None = None,
+    domain_bounds: Any = None,
+    mask_parameters: dict[str, Any] | None = None,
     variogram: dict[str, Any] | None = None,
     anisotropy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -235,6 +260,10 @@ def build_model_signature(
         "duplicate_method": duplicate_method,
         "interpolation_method": interpolation_method,
         "interpolation_parameters": interpolation_parameters or {},
+        "layer_mapping_scope": layer_mapping_scope,
+        "interpolation_domain": interpolation_domain,
+        "domain_bounds": domain_bounds,
+        "mask_parameters": mask_parameters or {},
         "variogram": variogram or {},
         "anisotropy": anisotropy or {},
         "control_points": [],

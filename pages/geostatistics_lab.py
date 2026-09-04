@@ -13,7 +13,7 @@ from core.active_data import (
     prepare_active_property_data,
     signatures_match,
 )
-from core.column_mapper import numeric_property_candidates
+from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import prepare_interpolation_dataframe
 from core.geostatistics.comparison import compare_methods
 from core.geostatistics.validation import leave_one_out_cross_validation
@@ -24,6 +24,7 @@ from core.geostatistics.variogram import (
     semivariance_unit,
 )
 from core.geometry.compartment import assign_prepared_observations_to_panels, filter_dataframe_to_selected_panels
+from core.layer_mapping import filter_values_excluding_semantics, layer_column, reservoir_layer_values
 from core.plotting.validation_plot import (
     observed_vs_predicted_figure,
     residual_histogram_figure,
@@ -39,6 +40,7 @@ from pages.shared import (
     panel_selection_control,
     pressure_reference_date_control,
     render_filter_controls,
+    reservoir_layer_control,
     unit_input,
 )
 from utils.constants import DUPLICATE_METHODS, INCLUDE_COLUMN
@@ -57,7 +59,8 @@ if df is None:
     st.info("Load data in the Data Manager before opening the Geostatistics Lab.")
     st.stop()
 
-mappings = st.session_state.get("column_mappings", {})
+mappings = normalize_column_mappings(st.session_state.get("column_mappings", {}))
+st.session_state.column_mappings = mappings
 x_col = mappings.get("x")
 y_col = mappings.get("y")
 well_col = mappings.get("well")
@@ -69,7 +72,7 @@ with st.sidebar:
     coordinate_unit = coordinate_unit_input("geostatistics_coordinate_unit")
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
     st.header("Filters")
-    render_filter_controls(df, mappings, "geostatistics_lab")
+    render_filter_controls(df, mappings, "geostatistics_lab", exclude_semantic_keys=("layer",))
     panel_layer = st.session_state.geometry_layers.get("panels")
     if panel_layer is not None and panel_layer.polygon_features:
         st.header("Panels")
@@ -114,14 +117,46 @@ if property_type == "Pressure":
         "geostatistics_pressure_reference_date_input",
     )
 
+filter_values_no_layer = filter_values_excluding_semantics(
+    mappings,
+    st.session_state.get("filter_values", {}),
+    ("layer",),
+)
+layer_col = layer_column(mappings)
+has_layer_column = bool(layer_col and layer_col in df.columns)
+active_for_layers = prepare_active_property_data(
+    df,
+    mappings,
+    property_col,
+    property_type,
+    pressure_reference_date,
+    filter_values_no_layer,
+    selected_panels if panel_layer is not None else None,
+).dataframe
+if selected_panels and panel_layer is not None and not mappings.get("panel"):
+    active_for_layers = filter_dataframe_to_selected_panels(active_for_layers, x_col, y_col, panel_layer, selected_panels)
+layer_options = reservoir_layer_values(active_for_layers, mappings) if has_layer_column else []
+selected_layer = None
+if has_layer_column:
+    with st.sidebar:
+        st.header("Reservoir Layer")
+        if layer_options:
+            selected_layer = reservoir_layer_control(layer_options, "geostatistics_selected_reservoir_layer")
+        else:
+            st.warning("No Reservoir Layer values are available after filters.")
+    if selected_layer is None:
+        st.warning("Select a Reservoir Layer before geostatistical analysis.")
+        st.stop()
+
 active_data = prepare_active_property_data(
     df,
     mappings,
     property_col,
     property_type,
     pressure_reference_date,
-    st.session_state.get("filter_values", {}),
+    filter_values_no_layer,
     selected_panels if panel_layer is not None else None,
+    selected_layers=[selected_layer] if selected_layer is not None else None,
 )
 filtered = active_data.dataframe
 if selected_panels and panel_layer is not None and not mappings.get("panel"):
@@ -136,7 +171,7 @@ prepared = prepare_interpolation_dataframe(
     property_col,
     include_col=INCLUDE_COLUMN,
     duplicate_method=duplicate_method,
-    metadata_columns=[column for column in [well_col, mappings.get("panel")] if column],
+    metadata_columns=[column for column in [well_col, mappings.get("panel"), layer_col] if column],
 )
 
 if prepared.empty:
@@ -331,7 +366,7 @@ with validation_tab:
         selected_panels=active_data.selected_panels,
         selected_layers=active_data.selected_layers,
         panel_interpolation_mode=panel_interpolation_mode,
-        filter_values=st.session_state.get("filter_values", {}),
+        filter_values=filter_values_no_layer,
         active_dataframe=filtered,
         duplicate_method=duplicate_method,
         interpolation_method=method,
@@ -427,7 +462,7 @@ with comparison_tab:
         selected_panels=active_data.selected_panels,
         selected_layers=active_data.selected_layers,
         panel_interpolation_mode=panel_interpolation_mode,
-        filter_values=st.session_state.get("filter_values", {}),
+        filter_values=filter_values_no_layer,
         active_dataframe=filtered,
         duplicate_method=duplicate_method,
         interpolation_method="Method Comparison",

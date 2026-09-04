@@ -13,6 +13,7 @@ import pandas as pd
 from shapely.geometry import mapping
 
 from core.active_data import panel_mode_from_legacy
+from core.column_mapper import normalize_column_mappings
 from core.crs import normalize_crs_config
 from core.data_loader import add_internal_row_id
 from core.geometry.loader import load_geojson_bytes
@@ -22,8 +23,8 @@ from core.scenarios import json_safe, scenario_metadata
 from utils.constants import INTERNAL_ROW_ID
 
 
-PROJECT_SCHEMA_VERSION = "1.1"
-SUPPORTED_PROJECT_SCHEMA_VERSIONS = {"1.0", PROJECT_SCHEMA_VERSION}
+PROJECT_SCHEMA_VERSION = "1.2"
+SUPPORTED_PROJECT_SCHEMA_VERSIONS = {"1.0", "1.1", PROJECT_SCHEMA_VERSION}
 
 
 class ProjectArchiveError(ValueError):
@@ -95,6 +96,35 @@ def _write_scenario(archive: zipfile.ZipFile, scenario: dict[str, object]) -> di
         if isinstance(frame, pd.DataFrame) and not frame.empty:
             archive.writestr(filename, frame.to_csv(index=False).encode("utf-8"))
     return {"id": scenario_id, "metadata_path": f"{base}.json", "arrays_path": f"{base}.npz"}
+
+
+def _write_map_result(
+    archive: zipfile.ZipFile,
+    map_result: dict[str, object],
+    base: str,
+) -> dict[str, object]:
+    archive.writestr(f"{base}.json", _json_bytes(scenario_metadata(map_result)))
+    arrays = {
+        "grid_x": np.asarray(map_result["grid_x"], dtype=float),
+        "grid_y": np.asarray(map_result["grid_y"], dtype=float),
+        "grid_z": np.asarray(map_result["grid_z"], dtype=float),
+    }
+    if map_result.get("grid_variance") is not None:
+        arrays["grid_variance"] = np.asarray(map_result["grid_variance"], dtype=float)
+    if map_result.get("panel_grid") is not None:
+        panel = np.asarray(map_result["panel_grid"], dtype=object)
+        arrays["panel_grid"] = np.where(pd.isna(panel), "", panel.astype(str))
+    array_buffer = BytesIO()
+    np.savez_compressed(array_buffer, **arrays)
+    archive.writestr(f"{base}.npz", array_buffer.getvalue())
+    for key, filename in [
+        ("included_observations", f"{base}_included.csv"),
+        ("excluded_observations", f"{base}_excluded.csv"),
+    ]:
+        frame = map_result.get(key)
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            archive.writestr(filename, frame.to_csv(index=False).encode("utf-8"))
+    return {"metadata_path": f"{base}.json", "arrays_path": f"{base}.npz"}
 
 
 def _serialize_geostatistics(geostatistics: dict[str, object] | None) -> dict[str, object]:
@@ -170,7 +200,7 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "project_schema_version": PROJECT_SCHEMA_VERSION,
         "project_metadata": state.get("project_metadata", {}),
         "source_name": state.get("source_name"),
-        "column_mappings": state.get("column_mappings", {}),
+        "column_mappings": normalize_column_mappings(state.get("column_mappings", {})),
         "additional_filter_columns": state.get("additional_filter_columns", []),
         "filter_values": state.get("filter_values", {}),
         "coordinate_unit": state.get("coordinate_unit"),
@@ -178,6 +208,11 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "pressure_reference_date": state.get("pressure_reference_date"),
         "selected_panels": state.get("selected_panels", []),
         "panel_interpolation_mode": panel_mode_from_legacy(state.get("panel_interpolation_mode"), False),
+        "layer_mapping_scope": state.get("layer_mapping_scope", "Selected Layer"),
+        "selected_reservoir_layer": state.get("selected_reservoir_layer"),
+        "active_generated_layer": state.get("active_generated_layer"),
+        "generated_layer_statuses": json_safe(state.get("generated_layer_statuses", [])),
+        "generated_layer_batch_signature": json_safe(state.get("generated_layer_batch_signature", {})),
         "crs": normalize_crs_config(state.get("crs", {})),
         "include_state": state.get("include_state", {}),
         "layer_settings": state.get("layer_settings", {}),
@@ -186,6 +221,7 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "geostatistics": _serialize_geostatistics(state.get("geostatistics", {})),
         "geometry_layers": [],
         "map_scenarios": [],
+        "generated_layer_maps": [],
         "current_scenario_id": state.get("current_scenario_id"),
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -213,6 +249,11 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         for scenario in state.get("map_scenarios", []) or []:
             manifest["map_scenarios"].append(_write_scenario(archive, scenario))
 
+        for index, (layer_name, map_result) in enumerate((state.get("generated_layer_maps", {}) or {}).items()):
+            base = f"generated_layers/layer_{index}"
+            info = _write_map_result(archive, map_result, base)
+            manifest["generated_layer_maps"].append({"layer": layer_name, **info})
+
         archive.writestr("project.json", _json_bytes(manifest))
     return buffer.getvalue()
 
@@ -222,6 +263,28 @@ def _read_optional_csv(archive: zipfile.ZipFile, path: str) -> pd.DataFrame:
         return pd.read_csv(BytesIO(archive.read(path)))
     except KeyError:
         return pd.DataFrame()
+
+
+def _read_map_result(
+    archive: zipfile.ZipFile,
+    metadata_path: str,
+    arrays_path: str,
+    base: str,
+) -> dict[str, object]:
+    metadata = _read_json(archive, metadata_path)
+    arrays = np.load(BytesIO(archive.read(arrays_path)), allow_pickle=False)
+    result = dict(metadata)
+    for key in ("grid_x", "grid_y", "grid_z", "grid_variance"):
+        if key in arrays:
+            result[key] = arrays[key]
+    if "panel_grid" in arrays:
+        panel = arrays["panel_grid"].astype(object)
+        result["panel_grid"] = np.where(panel == "", None, panel)
+    else:
+        result["panel_grid"] = None
+    result["included_observations"] = _read_optional_csv(archive, f"{base}_included.csv")
+    result["excluded_observations"] = _read_optional_csv(archive, f"{base}_excluded.csv")
+    return result
 
 
 def _parse_iso_date(value) -> date | None:
@@ -249,7 +312,7 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             "project_metadata": manifest.get("project_metadata", {}),
             "source_name": manifest.get("source_name"),
             "source_key": manifest.get("source_name"),
-            "column_mappings": manifest.get("column_mappings", {}),
+            "column_mappings": normalize_column_mappings(manifest.get("column_mappings", {})),
             "additional_filter_columns": manifest.get("additional_filter_columns", []),
             "filter_values": manifest.get("filter_values", {}),
             "coordinate_unit": manifest.get("coordinate_unit"),
@@ -257,6 +320,12 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             "pressure_reference_date": _parse_iso_date(manifest.get("pressure_reference_date")),
             "selected_panels": manifest.get("selected_panels", []),
             "panel_interpolation_mode": panel_mode_from_legacy(manifest.get("panel_interpolation_mode"), False),
+            "layer_mapping_scope": manifest.get("layer_mapping_scope", "Selected Layer"),
+            "selected_reservoir_layer": manifest.get("selected_reservoir_layer"),
+            "active_generated_layer": manifest.get("active_generated_layer"),
+            "generated_layer_maps": {},
+            "generated_layer_statuses": manifest.get("generated_layer_statuses", []),
+            "generated_layer_batch_signature": manifest.get("generated_layer_batch_signature", {}),
             "crs": normalize_crs_config(manifest.get("crs", {})),
             "include_state": {int(key): bool(value) for key, value in dict(manifest.get("include_state", {})).items()},
             "layer_settings": manifest.get("layer_settings", {}),
@@ -307,4 +376,13 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             scenario["included_observations"] = _read_optional_csv(archive, f"{base}_included.csv")
             scenario["excluded_observations"] = _read_optional_csv(archive, f"{base}_excluded.csv")
             state["map_scenarios"].append(scenario)
+        for index, map_info in enumerate(manifest.get("generated_layer_maps", []) or []):
+            layer_name = str(map_info.get("layer") or f"Layer {index + 1}")
+            base = str(map_info.get("metadata_path", f"generated_layers/layer_{index}.json")).rsplit(".", 1)[0]
+            state["generated_layer_maps"][layer_name] = _read_map_result(
+                archive,
+                str(map_info["metadata_path"]),
+                str(map_info["arrays_path"]),
+                base,
+            )
         return state

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import zipfile
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 
@@ -294,3 +298,79 @@ def test_scenario_and_geostatistics_new_state_round_trip_through_project_archive
     assert restored_geo["anisotropy_angle"] == 35.0
     assert restored_geo["anisotropy_ratio"] == 0.45
     assert restored_geo["cross_validation_signature"]["hash"] == generated["model_signature"]["hash"]
+
+
+def test_generated_layer_maps_round_trip_through_project_archive():
+    upper = _example_generated_map("Upper Pressure", "2025-01-01", 3000.0)
+    upper["reservoir_layer"] = "Upper"
+    upper["layer_mapping_scope"] = "All Layers"
+    upper["selected_layers"] = ["Upper"]
+    lower = _example_generated_map("Lower Pressure", "2025-01-01", 2500.0)
+    lower["reservoir_layer"] = "Lower"
+    lower["layer_mapping_scope"] = "All Layers"
+    lower["selected_layers"] = ["Lower"]
+    state = {
+        "project_metadata": {"name": "Layer Workspace"},
+        "source_name": "sample.csv",
+        "column_mappings": {"x": "X", "y": "Y", "property": "Pressure", "well": "Well", "layer": "Layer"},
+        "coordinate_unit": "m",
+        "property_unit": "psi",
+        "layer_mapping_scope": "All Layers",
+        "selected_reservoir_layer": "Upper",
+        "active_generated_layer": "Lower",
+        "generated_layer_maps": {"Upper": upper, "Lower": lower},
+        "generated_layer_statuses": [
+            {"layer": "Upper", "status": "Generated", "observations": 2, "message": ""},
+            {"layer": "Lower", "status": "Generated", "observations": 2, "message": ""},
+        ],
+        "generated_layer_batch_signature": {"hash": "batch-hash"},
+        "geometry_layers": {"reservoir_boundary": None, "panels": None, "faults": None, "custom": []},
+        "map_scenarios": [],
+        "working_df": pd.DataFrame(
+            {
+                "X": [0.0, 1.0],
+                "Y": [0.0, 1.0],
+                "Layer": ["Upper", "Lower"],
+                "Pressure": [3000.0, 2500.0],
+            }
+        ),
+    }
+
+    restored = load_project_archive(save_project_archive(state))
+
+    assert restored["layer_mapping_scope"] == "All Layers"
+    assert restored["selected_reservoir_layer"] == "Upper"
+    assert restored["active_generated_layer"] == "Lower"
+    assert restored["generated_layer_batch_signature"]["hash"] == "batch-hash"
+    assert set(restored["generated_layer_maps"]) == {"Upper", "Lower"}
+    assert restored["generated_layer_maps"]["Lower"]["reservoir_layer"] == "Lower"
+    assert np.array_equal(restored["generated_layer_maps"]["Upper"]["grid_z"], upper["grid_z"])
+    assert restored["generated_layer_statuses"][0]["layer"] == "Upper"
+
+
+def test_legacy_project_zone_mapping_promotes_to_layer_without_dropping_source_column():
+    data = pd.DataFrame(
+        {
+            "X": [0.0],
+            "Y": [0.0],
+            "Zone": ["Upper"],
+            "Pressure": [3000.0],
+        }
+    )
+    manifest = {
+        "project_schema_version": "1.1",
+        "source_name": "legacy.csv",
+        "column_mappings": {"x": "X", "y": "Y", "zone": "Zone"},
+        "working_data_path": "data/working_data.csv",
+    }
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("project.json", json.dumps(manifest).encode("utf-8"))
+        archive.writestr("data/working_data.csv", data.to_csv(index=False).encode("utf-8"))
+
+    restored = load_project_archive(buffer.getvalue())
+
+    assert restored["column_mappings"]["layer"] == "Zone"
+    assert "zone" not in restored["column_mappings"]
+    assert "Zone" in restored["working_df"].columns
+    assert restored["working_df"].loc[0, "Zone"] == "Upper"

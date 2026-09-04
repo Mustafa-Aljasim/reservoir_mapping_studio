@@ -16,7 +16,6 @@ SEMANTIC_FIELDS = {
     "reservoir": "Reservoir",
     "panel": "Panel",
     "layer": "Layer",
-    "zone": "Zone",
     "formation": "Formation",
     "measurement_date": "Original Measurement Date",
     "map_reference_date": "Pressure Map Reference Date",
@@ -29,7 +28,6 @@ METADATA_FILTER_ORDER = (
     "reservoir",
     "panel",
     "layer",
-    "zone",
     "formation",
     "well_type",
     "well_status",
@@ -67,7 +65,6 @@ COLUMN_ALIASES = {
     "reservoir": ("RESERVOIR", "RES", "FORMATION"),
     "panel": ("PANEL", "COMPARTMENT", "BLOCK"),
     "layer": ("LAYER", "ZONE", "INTERVAL"),
-    "zone": ("ZONE", "INTERVAL"),
     "formation": ("FORMATION", "FM", "RESERVOIR"),
     "measurement_date": (
         "MEASUREMENT_DATE",

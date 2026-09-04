@@ -35,6 +35,12 @@ def _session_snapshot() -> dict[str, object]:
         "coordinate_unit",
         "property_unit",
         "pressure_reference_date",
+        "layer_mapping_scope",
+        "selected_reservoir_layer",
+        "active_generated_layer",
+        "generated_layer_maps",
+        "generated_layer_statuses",
+        "generated_layer_batch_signature",
         "crs",
         "include_state",
         "geometry_layers",
@@ -56,6 +62,15 @@ def _apply_loaded_project(state: dict[str, object]) -> None:
     for key, value in state.items():
         st.session_state[key] = value
     st.session_state.generated_map = None
+    generated_layers = st.session_state.get("generated_layer_maps", {}) or {}
+    active_layer = st.session_state.get("active_generated_layer")
+    if generated_layers:
+        if active_layer not in generated_layers:
+            active_layer = next(iter(generated_layers))
+            st.session_state.active_generated_layer = active_layer
+        st.session_state.generated_map = generated_layers[active_layer]
+        mark_project_saved()
+        return
     current_id = st.session_state.get("current_scenario_id")
     for scenario in st.session_state.get("map_scenarios", []):
         if scenario.get("id") == current_id:
@@ -220,4 +235,3 @@ with library_tab:
             st.session_state.current_scenario_id = scenario["id"]
             mark_project_dirty()
             st.success("Map scenario saved.")
-

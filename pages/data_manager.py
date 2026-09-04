@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from core.column_mapper import numeric_property_candidates, suggest_mappings
+from core.column_mapper import normalize_column_mappings, numeric_property_candidates, suggest_mappings
 from core.data_loader import get_excel_sheet_names, load_uploaded_dataframe, summarize_dataframe
 from core.data_qc import build_qc_summary, duplicate_coordinate_rows, flag_outliers
 from core.geometry.loader import (
@@ -91,7 +91,7 @@ with preview_tab:
 with mapping_tab:
     st.markdown("#### Coordinate and Metadata Mapping")
     st.caption("Suggestions are based on common reservoir data column names and can be overridden.")
-    mappings = dict(st.session_state.get("column_mappings", {}))
+    mappings = normalize_column_mappings(st.session_state.get("column_mappings", {}))
     suggestions = suggest_mappings(df)
     columns = [column for column in df.columns if column != INTERNAL_ROW_ID]
 
@@ -146,7 +146,6 @@ with mapping_tab:
     optional_keys = [
         "panel",
         "layer",
-        "zone",
         "formation",
         "measurement_date",
         "map_reference_date",
