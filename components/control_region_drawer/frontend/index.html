@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Control Region Drawer</title>
+  <style>
+    :root {
+      --ink: #111827;
+      --muted: #475569;
+      --line: #cbd5e1;
+      --panel: #f8fafc;
+      --green: #0f766e;
+      --orange: #f97316;
+      --violet: #7c3aed;
+      --red: #dc2626;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      color: var(--ink);
+      background: #ffffff;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .shell {
+      box-sizing: border-box;
+      width: 100%;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border-bottom: 1px solid #e2e8f0;
+      background: var(--panel);
+      min-height: 46px;
+      box-sizing: border-box;
+      flex-wrap: wrap;
+    }
+    button {
+      appearance: none;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #ffffff;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #111827;
+      color: #ffffff;
+      border-color: #111827;
+    }
+    button.danger {
+      color: #991b1b;
+      border-color: #fecaca;
+      background: #fff7f7;
+    }
+    button:disabled {
+      color: #94a3b8;
+      border-color: #e2e8f0;
+      background: #f8fafc;
+      cursor: default;
+    }
+    .readout {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 46%;
+    }
+    .canvas-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 320px;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+    .status {
+      box-sizing: border-box;
+      min-height: 32px;
+      padding: 7px 10px;
+      border-top: 1px solid #e2e8f0;
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="toolbar">
+      <button id="start" class="primary" type="button">Start Drawing</button>
+      <button id="undo" type="button">Undo</button>
+      <button id="clear" type="button">Clear</button>
+      <button id="finish" type="button">Finish Polygon</button>
+      <button id="cancel" class="danger" type="button">Cancel</button>
+      <div id="readout" class="readout">Vertices: 0</div>
+    </div>
+    <div class="canvas-wrap">
+      <canvas id="canvas"></canvas>
+    </div>
+    <div id="status" class="status">Click the canvas to add Cartesian X/Y vertices.</div>
+  </div>
+
+  <script>
+    const Streamlit = {
+      setComponentReady() {
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+      },
+      setFrameHeight(height) {
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height }, "*");
+      },
+      setComponentValue(value) {
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value }, "*");
+      }
+    };
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const readout = document.getElementById("readout");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("start");
+    const undoBtn = document.getElementById("undo");
+    const clearBtn = document.getElementById("clear");
+    const finishBtn = document.getElementById("finish");
+    const cancelBtn = document.getElementById("cancel");
+
+    let args = {};
+    let vertices = [];
+    let drawingStarted = true;
+    let eventSeq = 0;
+    let bounds = { xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+    const pad = 44;
+
+    function finiteNumber(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function pointFrom(value) {
+      const x = finiteNumber(value && (value.x ?? value.X));
+      const y = finiteNumber(value && (value.y ?? value.Y));
+      if (x === null || y === null) return null;
+      return { x, y };
+    }
+
+    function collectBounds() {
+      const xs = [];
+      const ys = [];
+      const collectPoint = (point) => {
+        const parsed = pointFrom(point);
+        if (parsed) {
+          xs.push(parsed.x);
+          ys.push(parsed.y);
+        }
+      };
+      (args.points || []).forEach(collectPoint);
+      (args.excluded_points || []).forEach(collectPoint);
+      (args.controls || []).forEach(collectPoint);
+      vertices.forEach(collectPoint);
+      const collectRing = (ring) => (ring || []).forEach((pair) => {
+        if (!Array.isArray(pair) || pair.length < 2) return;
+        const x = finiteNumber(pair[0]);
+        const y = finiteNumber(pair[1]);
+        if (x !== null && y !== null) {
+          xs.push(x);
+          ys.push(y);
+        }
+      });
+      (args.polygons || []).forEach((poly) => (poly.rings || []).forEach(collectRing));
+      (args.regions || []).forEach((poly) => (poly.rings || []).forEach(collectRing));
+      (args.lines || []).forEach((line) => collectRing(line.points || []));
+
+      const supplied = args.bounds || {};
+      let xMin = finiteNumber(supplied.x_min ?? supplied.xMin);
+      let xMax = finiteNumber(supplied.x_max ?? supplied.xMax);
+      let yMin = finiteNumber(supplied.y_min ?? supplied.yMin);
+      let yMax = finiteNumber(supplied.y_max ?? supplied.yMax);
+      if (xMin === null || xMax === null || yMin === null || yMax === null || xMin === xMax || yMin === yMax) {
+        xMin = xs.length ? Math.min(...xs) : 0;
+        xMax = xs.length ? Math.max(...xs) : 1;
+        yMin = ys.length ? Math.min(...ys) : 0;
+        yMax = ys.length ? Math.max(...ys) : 1;
+      }
+      if (xMin === xMax) {
+        xMin -= 0.5;
+        xMax += 0.5;
+      }
+      if (yMin === yMax) {
+        yMin -= 0.5;
+        yMax += 0.5;
+      }
+      const xPad = (xMax - xMin) * 0.06;
+      const yPad = (yMax - yMin) * 0.06;
+      bounds = { xMin: xMin - xPad, xMax: xMax + xPad, yMin: yMin - yPad, yMax: yMax + yPad };
+    }
+
+    function resizeCanvas() {
+      const box = canvas.getBoundingClientRect();
+      const scale = window.devicePixelRatio || 1;
+      const width = Math.max(320, Math.floor(box.width * scale));
+      const height = Math.max(320, Math.floor(box.height * scale));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    }
+
+    function plotWidth() {
+      return Math.max(10, canvas.clientWidth - pad * 2);
+    }
+
+    function plotHeight() {
+      return Math.max(10, canvas.clientHeight - pad * 2);
+    }
+
+    function toScreen(point) {
+      const x = pad + ((point.x - bounds.xMin) / (bounds.xMax - bounds.xMin)) * plotWidth();
+      const y = pad + (1 - ((point.y - bounds.yMin) / (bounds.yMax - bounds.yMin))) * plotHeight();
+      return { x, y };
+    }
+
+    function toWorld(screenX, screenY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = bounds.xMin + ((screenX - rect.left - pad) / plotWidth()) * (bounds.xMax - bounds.xMin);
+      const y = bounds.yMin + (1 - ((screenY - rect.top - pad) / plotHeight())) * (bounds.yMax - bounds.yMin);
+      return { x, y };
+    }
+
+    function formatNumber(value) {
+      if (!Number.isFinite(value)) return "";
+      const abs = Math.abs(value);
+      if ((abs >= 100000 || abs < 0.001) && abs !== 0) return value.toExponential(4);
+      return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+    }
+
+    function drawGrid() {
+      ctx.strokeStyle = "#e2e8f0";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#64748b";
+      ctx.font = "11px Inter, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      for (let i = 0; i <= 5; i += 1) {
+        const xValue = bounds.xMin + (i / 5) * (bounds.xMax - bounds.xMin);
+        const yValue = bounds.yMin + (i / 5) * (bounds.yMax - bounds.yMin);
+        const x = toScreen({ x: xValue, y: bounds.yMin }).x;
+        const y = toScreen({ x: bounds.xMin, y: yValue }).y;
+        ctx.beginPath();
+        ctx.moveTo(x, pad);
+        ctx.lineTo(x, pad + plotHeight());
+        ctx.stroke();
+        ctx.fillText(formatNumber(xValue), x, pad + plotHeight() + 7);
+        ctx.beginPath();
+        ctx.moveTo(pad, y);
+        ctx.lineTo(pad + plotWidth(), y);
+        ctx.stroke();
+        ctx.textAlign = "right";
+        ctx.textBaseline = "middle";
+        ctx.fillText(formatNumber(yValue), pad - 7, y);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+      }
+      ctx.strokeStyle = "#94a3b8";
+      ctx.strokeRect(pad, pad, plotWidth(), plotHeight());
+    }
+
+    function drawRing(ring, stroke, fill, width, closePath) {
+      const points = (ring || []).map((pair) => Array.isArray(pair) ? { x: finiteNumber(pair[0]), y: finiteNumber(pair[1]) } : pointFrom(pair)).filter((point) => point && point.x !== null && point.y !== null);
+      if (points.length < 2) return;
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const screen = toScreen(point);
+        if (index === 0) ctx.moveTo(screen.x, screen.y);
+        else ctx.lineTo(screen.x, screen.y);
+      });
+      if (closePath) ctx.closePath();
+      if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fill();
+      }
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    }
+
+    function drawPolygons(polygons, stroke, fill, width) {
+      (polygons || []).forEach((poly) => {
+        (poly.rings || []).forEach((ring) => drawRing(ring, poly.stroke || stroke, poly.fill || fill, poly.width || width, true));
+      });
+    }
+
+    function drawLines(lines) {
+      (lines || []).forEach((line) => drawRing(line.points || [], line.stroke || "#b91c1c", null, line.width || 2, false));
+    }
+
+    function drawMarker(point, style) {
+      const parsed = pointFrom(point);
+      if (!parsed) return;
+      const screen = toScreen(parsed);
+      ctx.save();
+      ctx.strokeStyle = style.stroke;
+      ctx.fillStyle = style.fill;
+      ctx.lineWidth = style.lineWidth || 1.5;
+      if (style.symbol === "diamond") {
+        ctx.beginPath();
+        ctx.moveTo(screen.x, screen.y - style.size);
+        ctx.lineTo(screen.x + style.size, screen.y);
+        ctx.lineTo(screen.x, screen.y + style.size);
+        ctx.lineTo(screen.x - style.size, screen.y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      } else if (style.symbol === "x") {
+        ctx.beginPath();
+        ctx.moveTo(screen.x - style.size, screen.y - style.size);
+        ctx.lineTo(screen.x + style.size, screen.y + style.size);
+        ctx.moveTo(screen.x + style.size, screen.y - style.size);
+        ctx.lineTo(screen.x - style.size, screen.y + style.size);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(screen.x, screen.y, style.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawVertices() {
+      if (vertices.length) {
+        drawRing(vertices, "#111827", vertices.length >= 3 ? "rgba(249, 115, 22, 0.16)" : null, 2.5, vertices.length >= 3);
+      }
+      vertices.forEach((point, index) => {
+        drawMarker(point, { symbol: "circle", size: 5, fill: "#ffffff", stroke: "#111827", lineWidth: 2 });
+        const screen = toScreen(pointFrom(point));
+        ctx.fillStyle = "#111827";
+        ctx.font = "11px Inter, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(String(index + 1), screen.x, screen.y - 7);
+      });
+    }
+
+    function draw() {
+      resizeCanvas();
+      collectBounds();
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      drawGrid();
+      drawPolygons(args.polygons || [], "#0f172a", "rgba(15, 23, 42, 0.035)", 2);
+      drawPolygons(args.regions || [], "#7c3aed", "rgba(124, 58, 237, 0.12)", 2);
+      drawLines(args.lines || []);
+      (args.points || []).forEach((point) => drawMarker(point, { symbol: "circle", size: 5, fill: "#0f766e", stroke: "#ffffff", lineWidth: 1.5 }));
+      (args.excluded_points || []).forEach((point) => drawMarker(point, { symbol: "x", size: 5, fill: "#6b7280", stroke: "#6b7280", lineWidth: 2 }));
+      (args.controls || []).forEach((point) => drawMarker(point, { symbol: "diamond", size: 6, fill: point.region_id ? "#ffffff" : "#f97316", stroke: point.region_id ? "#7c3aed" : "#111827", lineWidth: 2 }));
+      drawVertices();
+      readout.textContent = `Vertices: ${vertices.length}`;
+      undoBtn.disabled = vertices.length === 0;
+      clearBtn.disabled = vertices.length === 0;
+      finishBtn.disabled = vertices.length < 3;
+    }
+
+    function emit(action) {
+      eventSeq += 1;
+      Streamlit.setComponentValue({
+        action,
+        vertices: vertices.map((point) => ({ x: Number(point.x), y: Number(point.y) })),
+        event_id: `${Date.now()}-${eventSeq}`
+      });
+    }
+
+    function nearestHover(mouseX, mouseY) {
+      const candidates = []
+        .concat((args.points || []).map((point) => ({ ...point, kind: "Measured" })))
+        .concat((args.excluded_points || []).map((point) => ({ ...point, kind: "Excluded" })))
+        .concat((args.controls || []).map((point) => ({ ...point, kind: "Control" })));
+      let best = null;
+      for (const item of candidates) {
+        const parsed = pointFrom(item);
+        if (!parsed) continue;
+        const screen = toScreen(parsed);
+        const distance = Math.hypot(screen.x - mouseX, screen.y - mouseY);
+        if (distance <= 11 && (!best || distance < best.distance)) {
+          best = { item, distance };
+        }
+      }
+      return best ? best.item : null;
+    }
+
+    canvas.addEventListener("click", (event) => {
+      if (!drawingStarted) return;
+      const world = toWorld(event.clientX, event.clientY);
+      if (!Number.isFinite(world.x) || !Number.isFinite(world.y)) return;
+      vertices.push({ x: world.x, y: world.y });
+      statusEl.textContent = `Added vertex ${vertices.length}: X ${formatNumber(world.x)}, Y ${formatNumber(world.y)} ${args.coordinate_unit || ""}`;
+      draw();
+      emit("update");
+    });
+
+    canvas.addEventListener("mousemove", (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+      const world = toWorld(event.clientX, event.clientY);
+      const hit = nearestHover(mouseX, mouseY);
+      if (hit) {
+        statusEl.textContent = hit.hover || `${hit.kind}: ${hit.label || ""} X ${formatNumber(hit.x)}, Y ${formatNumber(hit.y)}`;
+      } else {
+        statusEl.textContent = `Cursor: X ${formatNumber(world.x)}, Y ${formatNumber(world.y)} ${args.coordinate_unit || ""}`;
+      }
+    });
+
+    startBtn.addEventListener("click", () => {
+      drawingStarted = true;
+      statusEl.textContent = "Drawing is active. Click the canvas to add vertices.";
+    });
+    undoBtn.addEventListener("click", () => {
+      vertices.pop();
+      draw();
+      emit("update");
+    });
+    clearBtn.addEventListener("click", () => {
+      vertices = [];
+      draw();
+      emit("clear");
+    });
+    finishBtn.addEventListener("click", () => {
+      if (vertices.length < 3) {
+        statusEl.textContent = "Add at least three vertices before finishing.";
+        return;
+      }
+      emit("finish");
+    });
+    cancelBtn.addEventListener("click", () => {
+      vertices = [];
+      draw();
+      emit("cancel");
+    });
+
+    window.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type !== "streamlit:render") return;
+      args = data.args || {};
+      vertices = (args.vertices || []).map(pointFrom).filter(Boolean);
+      const height = Number(args.height) || 620;
+      Streamlit.setFrameHeight(height);
+      draw();
+    });
+    window.addEventListener("resize", draw);
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(620);
+    draw();
+  </script>
+</body>
+</html>

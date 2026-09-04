@@ -85,14 +85,18 @@ Engineering controls are explicit conditioning inputs supplied by the engineer. 
 
 Mapping Studio supports:
 
+- a raw measured-point context map before interpolation, including active reservoir boundary, panels, faults, custom geometry, manual controls, and saved control regions
 - manual engineering control points with active/inactive status, panel/date/layer/property scope, and comments
 - automatic panel assignment from panel polygons, or manual panel selection when only a data panel column exists
-- soft control regions from selected-well convex hulls with optional buffer, or from loaded polygon geometry
+- soft control regions drawn directly on the Cartesian Mapping Studio canvas, from selected-well convex hulls with optional buffer, or from loaded polygon geometry
+- drawn region validation for finite X/Y vertices, polygon area, safe topology repair, reservoir-domain clipping, selected-panel-domain clipping, layer scope, pressure reference date, target value, and point spacing
 - generated region control points on a regular internal spacing constrained to the region and selected panels
 - distinct map overlays for Engineering Controls, Control Regions, and optional Generated Region Points
 - QC warnings for duplicate controls, measured-well conflicts, overlapping regions with different targets, outside-boundary controls, wrong layer/panel/date scope, missing pressure dates, and non-finite values
 
-All interpolation methods use active matching controls as conditioning points only after Generate/Update is pressed. Adding, editing, toggling, or deleting controls changes the model signature and marks existing maps stale.
+All interpolation methods use active matching controls as conditioning points only after Generate/Update is pressed. Drawing a polygon is transient; saving, editing, toggling, duplicating, or deleting controls changes the model signature and marks existing maps stale.
+
+Drawn control regions use the uploaded engineering X/Y coordinate system directly. No lat/lon conversion, basemap, Folium, or Leaflet workflow is used.
 
 ## Map Comparison and Delta Maps
 

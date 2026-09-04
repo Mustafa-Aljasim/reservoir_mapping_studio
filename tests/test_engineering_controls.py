@@ -4,15 +4,20 @@ from datetime import date
 
 import numpy as np
 import pandas as pd
+import pytest
 from shapely.geometry import Point, Polygon
 
 from core.active_data import PANEL_MODE_COMBINED, PANEL_MODE_INDEPENDENT
 from core.data_qc import prepare_interpolation_dataframe
 from core.engineering_controls import (
+    DRAWN_CONTROL_REGION_SOURCE,
+    clip_control_region_to_active_domain,
     create_control_point,
     create_control_region,
     create_region_from_wells,
     engineering_controls_for_context,
+    polygon_from_vertices,
+    validate_control_region_parameters,
 )
 from core.geometry.models import GeometryFeature, GeometryLayer
 from core.geostatistics.validation import leave_one_out_cross_validation
@@ -25,6 +30,7 @@ from core.layer_mapping import (
     prepare_layer_observations,
     resolve_layer_method_parameters,
 )
+from core.plotting.map_builder import build_context_map_figure
 from core.project_io import load_project_archive, save_project_archive
 from core.scenarios import create_map_scenario, scenario_to_generated_map
 from utils.constants import INCLUDE_COLUMN, INTERNAL_ROW_ID
@@ -290,6 +296,218 @@ def test_control_region_from_selected_wells_honors_convex_hull_and_buffer():
     assert hull.geom_type == "Polygon"
 
 
+def test_drawn_control_region_preserves_cartesian_vertices_and_repairs_simple_topology():
+    drawn = polygon_from_vertices(
+        [
+            {"x": 10.0, "y": 20.0},
+            {"x": 11.0, "y": 20.0},
+            {"x": 11.0, "y": 21.0},
+            {"x": 10.0, "y": 21.0},
+        ]
+    )
+    repaired = polygon_from_vertices([(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)])
+
+    assert drawn.vertices[0] == (10.0, 20.0)
+    assert drawn.geometry.area == pytest.approx(1.0)
+    assert repaired.geometry.is_valid
+    assert repaired.warnings
+
+
+def test_drawn_control_region_rejects_nonfinite_and_invalid_parameters():
+    with pytest.raises(ValueError, match="non-finite"):
+        polygon_from_vertices([(0.0, 0.0), (np.nan, 1.0), (1.0, 0.0)])
+    with pytest.raises(ValueError, match="Target Value"):
+        validate_control_region_parameters(target_value=np.nan, spacing=1.0)
+    with pytest.raises(ValueError, match="Pressure Map Reference Date"):
+        validate_control_region_parameters(target_value=3000.0, spacing=1.0, property_type="Pressure")
+
+
+def test_drawn_control_region_clips_outside_reservoir_and_selected_panel_domain():
+    drawn = polygon_from_vertices([(-0.5, 0.0), (1.5, 0.0), (1.5, 1.0), (-0.5, 1.0)])
+
+    clipped = clip_control_region_to_active_domain(
+        drawn.geometry,
+        reservoir_boundary_layer=_reservoir_boundary(),
+        panel_layer=_panel_layer(),
+        selected_panels=["A"],
+    )
+
+    assert clipped.clipped is True
+    assert clipped.geometry.bounds == pytest.approx((0.0, 0.0, 1.0, 1.0))
+    assert any("outside the reservoir domain" in warning for warning in clipped.warnings)
+    assert any("outside the selected panel domain" in warning for warning in clipped.warnings)
+
+
+def test_base_context_map_shows_raw_measured_points_before_interpolation_with_pressure_hover():
+    frame = _layer_frame()[lambda item: item["Layer"] == "Upper"].copy()
+    included = frame[frame["Panel"] == "A"].copy()
+    excluded = frame[frame["Panel"] == "B"].copy()
+
+    figure = build_context_map_figure(
+        included,
+        excluded,
+        "X",
+        "Y",
+        "Pressure",
+        well_col="Well",
+        hover_columns=[("Reservoir Layer", "Layer"), ("Panel", "Panel")],
+        unit="psi",
+        coordinate_unit="meters",
+        is_pressure_map=True,
+        map_reference_date=date(2026, 1, 1),
+        map_reference_date_col="Map_Reference_Date",
+        style={"show_raw_points": True, "well_label_mode": "Well Name"},
+    )
+
+    names = [trace.name for trace in figure.data]
+    raw_trace = next(trace for trace in figure.data if trace.name == "Raw measured points")
+    assert "Raw measured points" in names
+    assert "Excluded observations" in names
+    assert "Map Reference Date" in raw_trace.hovertext[0]
+    assert "Reservoir Layer: Upper" in raw_trace.hovertext[0]
+    assert "Panel: A" in raw_trace.hovertext[0]
+
+
+def test_drawn_control_region_combined_panels_conditions_selected_panel_union():
+    region = create_control_region(
+        region_name="Drawn union",
+        geometry=Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]),
+        property_name="Pressure",
+        target_value=3150.0,
+        property_unit="psi",
+        reservoir_layer="Upper",
+        pressure_reference_date="2026-01-01",
+        control_point_spacing=0.5,
+        region_source=DRAWN_CONTROL_REGION_SOURCE,
+    )
+
+    selection = engineering_controls_for_context(
+        control_points=[],
+        control_regions=[region],
+        measured_dataframe=_layer_frame()[lambda frame: frame["Layer"] == "Upper"],
+        mappings=MAPPINGS,
+        property_col="Pressure",
+        property_type="Pressure",
+        property_unit="psi",
+        pressure_reference_date=date(2026, 1, 1),
+        reservoir_layer="Upper",
+        selected_panels=["A", "B"],
+        panel_interpolation_mode=PANEL_MODE_COMBINED,
+        x_col="X",
+        y_col="Y",
+        panel_layer=_panel_layer(),
+        reservoir_boundary_layer=_reservoir_boundary(),
+    )
+
+    assert {"A", "B"}.issubset(set(selection.dataframe["Panel"].dropna().astype(str)))
+    reservoir_geometry = _reservoir_boundary().features[0].geometry
+    assert all(
+        reservoir_geometry.covers(Point(float(row["X"]), float(row["Y"])))
+        for _, row in selection.dataframe.iterrows()
+    )
+
+
+def test_drawn_control_region_layer_and_pressure_date_scope_are_required():
+    regions = [
+        create_control_region(
+            region_name="Good drawn",
+            geometry=Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            property_name="Pressure",
+            target_value=3100.0,
+            property_unit="psi",
+            reservoir_layer="Upper",
+            pressure_reference_date="2026-01-01",
+            control_point_spacing=0.5,
+            region_source=DRAWN_CONTROL_REGION_SOURCE,
+            region_id="CR-GOOD",
+        ),
+        create_control_region(
+            region_name="Wrong layer",
+            geometry=Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            property_name="Pressure",
+            target_value=3100.0,
+            property_unit="psi",
+            reservoir_layer="Lower",
+            pressure_reference_date="2026-01-01",
+            control_point_spacing=0.5,
+            region_source=DRAWN_CONTROL_REGION_SOURCE,
+            region_id="CR-LAYER",
+        ),
+        create_control_region(
+            region_name="Wrong date",
+            geometry=Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            property_name="Pressure",
+            target_value=3100.0,
+            property_unit="psi",
+            reservoir_layer="Upper",
+            pressure_reference_date="2025-01-01",
+            control_point_spacing=0.5,
+            region_source=DRAWN_CONTROL_REGION_SOURCE,
+            region_id="CR-DATE",
+        ),
+    ]
+
+    selection = engineering_controls_for_context(
+        control_points=[],
+        control_regions=regions,
+        measured_dataframe=_layer_frame()[lambda frame: frame["Layer"] == "Upper"],
+        mappings=MAPPINGS,
+        property_col="Pressure",
+        property_type="Pressure",
+        property_unit="psi",
+        pressure_reference_date=date(2026, 1, 1),
+        reservoir_layer="Upper",
+        selected_panels=[],
+        panel_interpolation_mode=PANEL_MODE_COMBINED,
+        x_col="X",
+        y_col="Y",
+        panel_layer=None,
+        reservoir_boundary_layer=_reservoir_boundary(),
+    )
+
+    assert [region["Region_ID"] for region in selection.regions] == ["CR-GOOD"]
+
+
+@pytest.mark.parametrize(
+    ("method", "parameters"),
+    [
+        ("IDW", {"power": 2.0, "neighbors": 10, "min_neighbors": 1, "search_radius": None}),
+        ("RBF", {"kernel": "linear", "smoothing": 0.0, "neighbors": None, "epsilon": None}),
+        (
+            "Ordinary Kriging",
+            {
+                "variogram_mode": "Manual",
+                "variogram_model": "Spherical",
+                "variogram_range_convention": VARIOGRAM_RANGE_CONVENTION,
+                "range": 2.0,
+                "variance": 10000.0,
+                "nugget": 0.0,
+                "max_neighbors": None,
+                "search_radius": None,
+            },
+        ),
+    ],
+)
+def test_drawn_control_region_influences_idw_rbf_and_ordinary_kriging(method, parameters):
+    region = create_control_region(
+        region_name="High support",
+        geometry=Polygon([(0.5, 0.25), (1.0, 0.25), (1.0, 0.75), (0.5, 0.75)]),
+        property_name="Pressure",
+        target_value=4200.0,
+        property_unit="psi",
+        reservoir_layer="Upper",
+        pressure_reference_date="2026-01-01",
+        control_point_spacing=0.5,
+        region_source=DRAWN_CONTROL_REGION_SOURCE,
+    )
+
+    baseline = _generate(_layer_frame(), method=method, method_parameters=parameters).maps["Upper"]["grid_z"][1, 1]
+    controlled = _generate(_layer_frame(), regions=[region], method=method, method_parameters=parameters).maps["Upper"]["grid_z"][1, 1]
+
+    assert np.isfinite(controlled)
+    assert abs(float(controlled) - float(baseline)) > 1e-6
+
+
 def test_control_conflict_with_measured_observation_warns_and_uses_measured_precedence():
     dataframe = _layer_frame()
     control = create_control_point(
@@ -505,6 +723,7 @@ def test_project_and_scenario_persistence_restore_control_definitions():
         panel="A",
         pressure_reference_date="2026-01-01",
         control_point_spacing=0.25,
+        region_source=DRAWN_CONTROL_REGION_SOURCE,
     )
     generated = _generate(_layer_frame(), controls=[{**control, "Active": True}], regions=[region]).maps["Upper"]
     scenario = create_map_scenario("Controlled Upper", generated)
@@ -529,8 +748,10 @@ def test_project_and_scenario_persistence_restore_control_definitions():
 
     assert opened["engineering_control_points"][0]["Value"] == 4200.0
     assert opened["engineering_control_regions"][0]["Target_Value"] == 3500.0
+    assert opened["engineering_control_regions"][0]["Region_Source"] == DRAWN_CONTROL_REGION_SOURCE
     assert restored["engineering_control_points"][0]["Active"] is False
     assert restored["engineering_control_regions"][0]["Geometry"].area == region["Geometry"].area
+    assert restored["engineering_control_regions"][0]["Region_Source"] == DRAWN_CONTROL_REGION_SOURCE
     assert len(restored["map_scenarios"][0]["engineering_control_points"]) == 1
     assert restored["map_scenarios"][0]["control_region_count"] == 1
     assert restored["map_scenarios"][0]["engineering_control_count"] == len(scenario["engineering_controls"])

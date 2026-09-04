@@ -116,6 +116,8 @@ def add_control_region_overlays(
             f"Generated Controls: {int(normalized.get('Generated_Control_Count') or 0)}",
             f"Spacing: {format_distance(normalized.get('Control_Point_Spacing'), coordinate_unit)}",
         ]
+        if normalized.get("Region_Source"):
+            hover_lines.append(f"Source: {normalized.get('Region_Source')}")
         if normalized.get("Panel"):
             hover_lines.append(f"Panel: {normalized.get('Panel')}")
         if normalized.get("Comment"):

@@ -7,23 +7,34 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from shapely.geometry.base import BaseGeometry
 
+from components.control_region_drawer import control_region_drawer
 from core.active_data import prepare_active_property_data
 from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import build_qc_summary, descriptive_statistics, flag_outliers
 from core.engineering_controls import (
     CONTROL_POINT_COLUMNS,
     CONTROL_REGION_COLUMNS,
+    DRAWN_CONTROL_REGION_SOURCE,
+    EXISTING_GEOMETRY_REGION_SOURCE,
+    REGION_CONTROL_SOURCE,
+    SELECTED_WELLS_REGION_SOURCE,
     assign_panel_from_point,
+    clip_control_region_to_active_domain,
     controls_dataframe,
     controls_for_plot,
     create_control_point,
     create_control_region,
     create_region_from_wells,
     engineering_controls_for_context,
+    next_region_id,
     normalize_control_point,
     normalize_control_region,
+    normalize_polygon_vertices,
+    polygon_from_vertices,
     regions_dataframe,
+    validate_control_region_parameters,
 )
 from core.filtering import build_filter_column_list
 from core.geometry.assignment import assign_points_to_polygons, outside_panel_count
@@ -56,7 +67,8 @@ from core.masking import auto_maximum_distance
 from core.pressure_dates import format_map_date, summarize_measurement_dates
 from core.plotting.geometry_layers import add_fault_layer, add_polygon_layer
 from core.plotting.engineering_controls import add_control_region_overlays, add_engineering_control_traces
-from core.plotting.map_builder import build_map_figure, move_observation_traces_to_top
+from core.plotting.map_builder import build_context_map_figure, build_map_figure, move_observation_traces_to_top
+from core.plotting.styling import format_numeric
 from core.scenarios import (
     create_map_scenario,
     duplicate_scenario,
@@ -123,7 +135,13 @@ def auto_idw_search_radius(prepared: pd.DataFrame, buffer_fraction: float = 0.03
 
 
 def generated_hover_columns(mappings: dict[str, str | None]) -> list[tuple[str, str]]:
-    return build_filter_column_list(mappings, st.session_state.get("additional_filter_columns", []))
+    columns = list(build_filter_column_list(mappings, st.session_state.get("additional_filter_columns", [])))
+    used = {column for _, column in columns}
+    for label, column in [("Reservoir Layer", mappings.get("layer")), ("Panel", mappings.get("panel"))]:
+        if column and column not in used:
+            columns.append((label, column))
+            used.add(column)
+    return columns
 
 
 def convert_grid_for_display(grid: np.ndarray, source_unit: str | None, display_unit: str | None) -> np.ndarray:
@@ -394,10 +412,22 @@ def render_layer_manager() -> dict[str, object]:
     settings = dict(st.session_state.get("layer_settings", {}))
     geometry_layers = st.session_state.geometry_layers
     custom_layers = geometry_layers.get("custom", [])
+    generated_available = bool(st.session_state.get("generated_map") or st.session_state.get("generated_layer_maps"))
 
-    settings["show_surface"] = st.checkbox("Property Surface", value=bool(settings.get("show_surface", True)))
-    settings["show_wells"] = st.checkbox("Wells", value=bool(settings.get("show_wells", True)))
-    settings["show_excluded"] = st.checkbox("Excluded Wells", value=bool(settings.get("show_excluded", True)))
+    raw_default = bool(settings.get("show_raw_points", settings.get("show_wells", True)))
+    settings["show_raw_points"] = st.checkbox("Raw Measured Points", value=raw_default)
+    settings["show_wells"] = settings["show_raw_points"]
+    settings["show_excluded"] = st.checkbox("Excluded Observations", value=bool(settings.get("show_excluded", True)))
+    settings["show_surface"] = st.checkbox(
+        "Property Surface",
+        value=bool(settings.get("show_surface", True)),
+        disabled=not generated_available,
+    )
+    settings["show_contours"] = st.checkbox(
+        "Contours",
+        value=bool(settings.get("show_contours", True)),
+        disabled=not generated_available,
+    )
     settings["show_engineering_controls"] = st.checkbox(
         "Engineering Controls",
         value=bool(settings.get("show_engineering_controls", True)),
@@ -534,6 +564,250 @@ def controls_display_frame(selection, property_col: str, source_unit: str | None
     frame = convert_observations_for_display(frame, property_col, source_unit, display_unit)
     frame["Value"] = frame[property_col]
     return frame
+
+
+def plot_style_with_overlay_settings(
+    style: dict[str, object],
+    layer_settings: dict[str, object],
+    *,
+    generated_surface: bool,
+) -> dict[str, object]:
+    combined = {**style, **layer_settings}
+    raw_points_visible = bool(style.get("show_wells", True)) and bool(
+        layer_settings.get("show_raw_points", layer_settings.get("show_wells", True))
+    )
+    combined["show_raw_points"] = raw_points_visible
+    combined["show_wells"] = raw_points_visible
+    combined["show_excluded"] = bool(style.get("show_excluded", True)) and bool(layer_settings.get("show_excluded", True))
+    if not generated_surface:
+        combined["show_surface"] = False
+        combined["show_contour_lines"] = False
+        combined["show_contour_labels"] = False
+    elif not bool(layer_settings.get("show_contours", True)):
+        combined["show_contour_lines"] = False
+        combined["show_contour_labels"] = False
+    return combined
+
+
+def split_observations_for_display(
+    frame: pd.DataFrame,
+    property_col: str,
+    source_unit: str | None,
+    display_unit: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if frame.empty:
+        return frame.copy(), frame.copy()
+    included = frame[frame[INCLUDE_COLUMN]].copy() if INCLUDE_COLUMN in frame else frame.copy()
+    excluded = frame[~frame[INCLUDE_COLUMN]].copy() if INCLUDE_COLUMN in frame else frame.iloc[0:0].copy()
+    return (
+        convert_observations_for_display(included, property_col, source_unit, display_unit),
+        convert_observations_for_display(excluded, property_col, source_unit, display_unit),
+    )
+
+
+def _polygon_rings_payload(geometry: BaseGeometry | None) -> list[list[list[float]]]:
+    if not isinstance(geometry, BaseGeometry) or geometry.is_empty:
+        return []
+    polygons = [geometry] if geometry.geom_type == "Polygon" else list(geometry.geoms) if geometry.geom_type == "MultiPolygon" else []
+    rings: list[list[list[float]]] = []
+    for polygon in polygons:
+        x_values, y_values = polygon.exterior.xy
+        rings.append([[float(x), float(y)] for x, y in zip(x_values, y_values)])
+    return rings
+
+
+def _line_points_payload(geometry: BaseGeometry | None) -> list[list[list[float]]]:
+    if not isinstance(geometry, BaseGeometry) or geometry.is_empty:
+        return []
+    lines = [geometry] if geometry.geom_type == "LineString" else list(geometry.geoms) if geometry.geom_type == "MultiLineString" else []
+    return [
+        [[float(x), float(y)] for x, y in zip(*line.xy)]
+        for line in lines
+    ]
+
+
+def geometry_polygons_payload(layer, *, stroke: str, fill: str, width: float) -> list[dict[str, object]]:
+    if layer is None:
+        return []
+    payload: list[dict[str, object]] = []
+    for feature in layer.polygon_features:
+        rings = _polygon_rings_payload(feature.geometry)
+        if rings:
+            payload.append({"name": feature.name, "rings": rings, "stroke": stroke, "fill": fill, "width": width})
+    return payload
+
+
+def geometry_lines_payload(layer, *, stroke: str, width: float) -> list[dict[str, object]]:
+    if layer is None:
+        return []
+    payload: list[dict[str, object]] = []
+    for feature in layer.line_features:
+        for points in _line_points_payload(feature.geometry):
+            payload.append({"name": feature.name, "points": points, "stroke": stroke, "width": width})
+    return payload
+
+
+def control_regions_payload(regions: list[dict[str, object]] | tuple[dict[str, object], ...]) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    for region in regions or []:
+        normalized = normalize_control_region(region)
+        rings = _polygon_rings_payload(normalized.get("Geometry"))
+        if rings:
+            payload.append({"name": normalized.get("Region_Name") or normalized.get("Region_ID"), "rings": rings})
+    return payload
+
+
+def observation_points_payload(
+    frame: pd.DataFrame,
+    *,
+    x_col: str,
+    y_col: str,
+    property_col: str,
+    well_col: str | None,
+    layer_col: str | None,
+    panel_col: str | None,
+    unit: str,
+    is_pressure_map: bool,
+    pressure_reference_date,
+) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    if frame.empty:
+        return payload
+    for index, row in frame.iterrows():
+        x_value = pd.to_numeric(pd.Series([row.get(x_col)]), errors="coerce").iloc[0]
+        y_value = pd.to_numeric(pd.Series([row.get(y_col)]), errors="coerce").iloc[0]
+        if pd.isna(x_value) or pd.isna(y_value) or not np.isfinite(float(x_value)) or not np.isfinite(float(y_value)):
+            continue
+        label = str(row.get(well_col)) if well_col and pd.notna(row.get(well_col)) else f"Row {index}"
+        value = pd.to_numeric(pd.Series([row.get(property_col)]), errors="coerce").iloc[0]
+        hover_lines = [
+            f"Well: {label}",
+            f"{property_col}: {format_numeric(value)} {unit}".strip(),
+        ]
+        if layer_col and layer_col in frame.columns and pd.notna(row.get(layer_col)):
+            hover_lines.append(f"Reservoir Layer: {row.get(layer_col)}")
+        if panel_col and panel_col in frame.columns and pd.notna(row.get(panel_col)):
+            hover_lines.append(f"Panel: {row.get(panel_col)}")
+        if is_pressure_map:
+            hover_lines.append(f"Map Reference Date: {format_map_date(pressure_reference_date)}")
+        hover_lines.append(f"{x_col}: {format_numeric(x_value)}")
+        hover_lines.append(f"{y_col}: {format_numeric(y_value)}")
+        payload.append(
+            {
+                "x": float(x_value),
+                "y": float(y_value),
+                "label": label,
+                "value": None if pd.isna(value) else float(value),
+                "hover": " | ".join(hover_lines),
+            }
+        )
+    return payload
+
+
+def controls_payload(controls: pd.DataFrame, *, x_col: str, y_col: str) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    if controls is None or controls.empty:
+        return payload
+    working = controls.copy()
+    if x_col not in working.columns and "X" in working.columns:
+        working[x_col] = working["X"]
+    if y_col not in working.columns and "Y" in working.columns:
+        working[y_col] = working["Y"]
+    for _, row in working.iterrows():
+        x_value = pd.to_numeric(pd.Series([row.get(x_col)]), errors="coerce").iloc[0]
+        y_value = pd.to_numeric(pd.Series([row.get(y_col)]), errors="coerce").iloc[0]
+        if pd.isna(x_value) or pd.isna(y_value) or not np.isfinite(float(x_value)) or not np.isfinite(float(y_value)):
+            continue
+        payload.append(
+            {
+                "x": float(x_value),
+                "y": float(y_value),
+                "label": str(row.get("Control_ID") or ""),
+                "region_id": str(row.get("Region_ID") or ""),
+                "hover": f"Control: {row.get('Control_ID') or ''} | X {format_numeric(x_value)} | Y {format_numeric(y_value)}",
+            }
+        )
+    return payload
+
+
+def controls_for_overlay(controls: pd.DataFrame, layer_settings: dict[str, object]) -> pd.DataFrame:
+    if controls is None or controls.empty:
+        return pd.DataFrame()
+    source = controls.get("Source_Type", pd.Series("", index=controls.index)).astype(str)
+    manual_keep = (source != REGION_CONTROL_SOURCE) & bool(layer_settings.get("show_engineering_controls", True))
+    region_keep = (source == REGION_CONTROL_SOURCE) & bool(layer_settings.get("show_region_control_points", False))
+    return controls.loc[manual_keep | region_keep].copy()
+
+
+def drawing_vertices_state() -> list[dict[str, float]]:
+    try:
+        return normalize_polygon_vertices(st.session_state.get("control_region_draw_vertices", []))
+    except ValueError:
+        vertices = []
+        for vertex in st.session_state.get("control_region_draw_vertices", []) or []:
+            if isinstance(vertex, dict) and "x" in vertex and "y" in vertex:
+                vertices.append({"X": vertex["x"], "Y": vertex["y"]})
+            elif isinstance(vertex, dict):
+                vertices.append({"X": vertex.get("X"), "Y": vertex.get("Y")})
+        return vertices
+
+
+def draw_payload_bounds(*payload_groups: list[dict[str, object]]) -> dict[str, float]:
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def collect_point(x_value, y_value) -> None:
+        x = pd.to_numeric(pd.Series([x_value]), errors="coerce").iloc[0]
+        y = pd.to_numeric(pd.Series([y_value]), errors="coerce").iloc[0]
+        if pd.notna(x) and pd.notna(y) and np.isfinite(float(x)) and np.isfinite(float(y)):
+            xs.append(float(x))
+            ys.append(float(y))
+
+    for group in payload_groups:
+        for item in group:
+            if "x" in item and "y" in item:
+                collect_point(item.get("x"), item.get("y"))
+            for ring in item.get("rings", []) or []:
+                for point in ring:
+                    if isinstance(point, (list, tuple)) and len(point) >= 2:
+                        collect_point(point[0], point[1])
+            for point in item.get("points", []) or []:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    collect_point(point[0], point[1])
+    if not xs or not ys:
+        return {}
+    return {"x_min": min(xs), "x_max": max(xs), "y_min": min(ys), "y_max": max(ys)}
+
+
+def render_vertices_editor(vertices_key: str, editor_key: str) -> None:
+    vertices = st.session_state.get(vertices_key, []) or []
+    if not vertices:
+        return
+    rows = []
+    for index, vertex in enumerate(vertices, start=1):
+        x_value, y_value = (vertex.get("x"), vertex.get("y")) if isinstance(vertex, dict) else (None, None)
+        if isinstance(vertex, dict):
+            x_value = vertex.get("X", x_value)
+            y_value = vertex.get("Y", y_value)
+        rows.append({"Vertex": index, "X": x_value, "Y": y_value})
+    table = pd.DataFrame(rows)
+    edited = st.data_editor(
+        table,
+        width="stretch",
+        hide_index=True,
+        disabled=["Vertex"],
+        column_config={
+            "X": st.column_config.NumberColumn("X"),
+            "Y": st.column_config.NumberColumn("Y"),
+        },
+        key=editor_key,
+    )
+    if not edited[["X", "Y"]].equals(table[["X", "Y"]]):
+        st.session_state[vertices_key] = [
+            {"X": row.get("X"), "Y": row.get("Y")}
+            for _, row in edited.iterrows()
+        ]
+        st.rerun()
 
 
 def statuses_frame(statuses: list[object] | tuple[object, ...]) -> pd.DataFrame:
@@ -1115,13 +1389,54 @@ with controls_col:
                 st.rerun()
 
         with region_tab:
+            source_options = [
+                DRAWN_CONTROL_REGION_SOURCE,
+                SELECTED_WELLS_REGION_SOURCE,
+                EXISTING_GEOMETRY_REGION_SOURCE,
+            ]
+            source_aliases = {
+                "Selected Wells Convex Hull": SELECTED_WELLS_REGION_SOURCE,
+                "Existing Polygon": EXISTING_GEOMETRY_REGION_SOURCE,
+            }
+            current_source = source_aliases.get(
+                st.session_state.get("engineering_control_region_source"),
+                st.session_state.get("engineering_control_region_source"),
+            )
+            if current_source not in source_options:
+                current_source = DRAWN_CONTROL_REGION_SOURCE
+            st.session_state.engineering_control_region_source = current_source
             region_source = st.radio(
                 "Region Source",
-                ["Selected Wells Convex Hull", "Existing Polygon"],
+                source_options,
+                index=source_options.index(current_source),
                 horizontal=True,
                 key="engineering_control_region_source",
             )
             region_name = st.text_input("Region Name", key="engineering_control_region_name")
+            region_scope_layer = controls_scope_layer
+            if has_layer_column:
+                if layer_options:
+                    current_region_layer = st.session_state.get("engineering_control_region_layer")
+                    default_layer = (
+                        current_region_layer
+                        if current_region_layer in layer_options
+                        else controls_scope_layer
+                        if controls_scope_layer in layer_options
+                        else layer_options[0]
+                    )
+                    region_scope_layer = st.selectbox(
+                        "Reservoir Layer",
+                        layer_options,
+                        index=layer_options.index(default_layer),
+                        key="engineering_control_region_layer",
+                    )
+                else:
+                    region_scope_layer = None
+                    st.warning("Select filters that leave at least one Reservoir Layer before saving a control region.")
+            else:
+                st.caption("Reservoir Layer: Unspecified")
+            st.caption(f"Region unit: {unit or 'unitless'}")
+
             region_cols = st.columns(3)
             region_target = region_cols[0].number_input(
                 "Target Value",
@@ -1138,11 +1453,122 @@ with controls_col:
             region_panel = ""
             if panel_layer is not None and panel_layer.polygon_features and len(selected_panels) == 1:
                 region_panel = str(selected_panels[0])
+                st.caption(f"Panel context: {region_panel}")
+            elif panel_layer is not None and panel_layer.polygon_features and selected_panels:
+                st.caption(f"Panel context: selected panel union ({len(selected_panels):,} panels)")
+            elif panel_layer is not None and panel_layer.polygon_features:
+                st.caption("Panel context: all loaded panels")
             elif panel_layer is None and panel_options:
                 region_panel = st.selectbox("Region Panel", [""] + panel_options, key="engineering_control_region_panel")
             region_comment = st.text_input("Region Comment", key="engineering_control_region_comment")
 
-            if region_source == "Selected Wells Convex Hull":
+            def save_region_from_geometry(geometry, fallback_name: str, panel_scope: str, source_label: str) -> None:
+                if has_layer_column and not region_scope_layer:
+                    st.error("Select a Reservoir Layer before saving this control region.")
+                    return
+                try:
+                    target_value, spacing_value, layer_value = validate_control_region_parameters(
+                        target_value=region_target,
+                        spacing=region_spacing,
+                        reservoir_layer=region_scope_layer,
+                        valid_layers=layer_options if has_layer_column else None,
+                        property_type=property_type,
+                        pressure_reference_date=controls_reference_date,
+                    )
+                    new_region = create_control_region(
+                        region_name=region_name or fallback_name,
+                        geometry=geometry,
+                        property_name=property_col,
+                        target_value=target_value,
+                        property_unit=unit,
+                        reservoir_layer=layer_value,
+                        panel=panel_scope,
+                        pressure_reference_date=controls_reference_date,
+                        control_point_spacing=spacing_value,
+                        active=region_active,
+                        comment=region_comment,
+                        region_source=source_label,
+                        existing_regions=control_regions,
+                    )
+                    st.session_state.engineering_control_regions = control_regions + [new_region]
+                    st.session_state.pending_control_region_vertices = []
+                    st.session_state.control_region_draw_vertices = []
+                    st.session_state.control_region_drawing_active = False
+                    mark_project_dirty()
+                    st.success("Soft control region added. Update the map to apply its generated controls.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+            if region_source == DRAWN_CONTROL_REGION_SOURCE:
+                draw_cols = st.columns(3)
+                if draw_cols[0].button("[DRAW CONTROL REGION]", type="primary", width="stretch"):
+                    st.session_state.control_region_drawing_active = True
+                    st.session_state.control_region_draw_vertices = []
+                    st.session_state.pending_control_region_vertices = []
+                    st.session_state.last_control_region_draw_event_id = ""
+                    st.rerun()
+                if draw_cols[1].button("Clear Drawing", width="stretch"):
+                    st.session_state.control_region_draw_vertices = []
+                    st.session_state.pending_control_region_vertices = []
+                    st.session_state.control_region_drawing_active = False
+                    st.rerun()
+                if st.session_state.get("control_region_drawing_active"):
+                    st.info("Drawing is active on the Mapping Studio canvas.")
+                    with st.expander("Polygon Vertices", expanded=False):
+                        render_vertices_editor("control_region_draw_vertices", "engineering_control_draw_vertices_editor")
+
+                pending_vertices = st.session_state.get("pending_control_region_vertices", []) or []
+                if pending_vertices:
+                    with st.expander("Polygon Vertices", expanded=True):
+                        render_vertices_editor("pending_control_region_vertices", "engineering_control_pending_vertices_editor")
+                    try:
+                        drawn = polygon_from_vertices(st.session_state.get("pending_control_region_vertices", []))
+                        clip_result = clip_control_region_to_active_domain(
+                            drawn.geometry,
+                            reservoir_boundary_layer=reservoir_boundary_layer,
+                            panel_layer=panel_layer,
+                            selected_panels=selected_panels,
+                        )
+                        for warning in drawn.warnings:
+                            st.warning(warning)
+                        for warning in clip_result.warnings:
+                            st.warning(warning)
+                        if clip_result.clipped:
+                            clip_choice = st.radio(
+                                "Domain Adjustment",
+                                ["Clip to Reservoir Domain", "Cancel and Redraw"],
+                                index=0,
+                                horizontal=True,
+                                key="engineering_control_region_clip_choice",
+                            )
+                        else:
+                            clip_choice = "Clip to Reservoir Domain"
+                        st.caption(
+                            f"Drawn region area after domain handling: "
+                            f"{format_numeric(clip_result.geometry.area)} {coordinate_unit_symbol(coordinate_unit)}^2"
+                        )
+                        action_cols = st.columns(2)
+                        if action_cols[0].button("Save Control Region", type="primary", width="stretch"):
+                            if clip_choice == "Cancel and Redraw":
+                                st.error("Choose Clip to Reservoir Domain before saving, or clear the drawing and redraw.")
+                            else:
+                                save_region_from_geometry(
+                                    clip_result.geometry,
+                                    "Drawn Control Region",
+                                    region_panel,
+                                    DRAWN_CONTROL_REGION_SOURCE,
+                                )
+                        if action_cols[1].button("Cancel and Redraw", width="stretch"):
+                            st.session_state.pending_control_region_vertices = []
+                            st.session_state.control_region_draw_vertices = []
+                            st.session_state.control_region_drawing_active = True
+                            st.session_state.last_control_region_draw_event_id = ""
+                            st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+            elif region_source == SELECTED_WELLS_REGION_SOURCE:
                 buffer_distance = st.number_input(
                     f"Hull Buffer ({coordinate_unit_symbol(coordinate_unit)})",
                     min_value=0.0,
@@ -1172,24 +1598,12 @@ with controls_col:
                         selected_wells = seed_frame[seed_frame["_Seed_Key"].isin(selected_seed_ids)]
                         try:
                             geometry = create_region_from_wells(selected_wells, x_col, y_col, float(buffer_distance))
-                            new_region = create_control_region(
-                                region_name=region_name or "Well Hull Control Region",
-                                geometry=geometry,
-                                property_name=property_col,
-                                target_value=float(region_target),
-                                property_unit=unit,
-                                reservoir_layer=controls_scope_layer,
-                                panel=region_panel,
-                                pressure_reference_date=controls_reference_date,
-                                control_point_spacing=float(region_spacing),
-                                active=region_active,
-                                comment=region_comment,
-                                existing_regions=control_regions,
+                            save_region_from_geometry(
+                                geometry,
+                                "Well Hull Control Region",
+                                region_panel,
+                                SELECTED_WELLS_REGION_SOURCE,
                             )
-                            st.session_state.engineering_control_regions = control_regions + [new_region]
-                            mark_project_dirty()
-                            st.success("Soft control region added. Update the map to apply its generated controls.")
-                            st.rerun()
                         except ValueError as exc:
                             st.error(str(exc))
             else:
@@ -1213,24 +1627,12 @@ with controls_col:
                     if chosen_panel:
                         st.caption(f"Region panel scope: {chosen_panel}")
                     if st.button("Create Region From Polygon", type="primary", width="stretch"):
-                        new_region = create_control_region(
-                            region_name=region_name or str(chosen_polygon["label"]),
-                            geometry=chosen_polygon["geometry"],
-                            property_name=property_col,
-                            target_value=float(region_target),
-                            property_unit=unit,
-                            reservoir_layer=controls_scope_layer,
-                            panel=chosen_panel,
-                            pressure_reference_date=controls_reference_date,
-                            control_point_spacing=float(region_spacing),
-                            active=region_active,
-                            comment=region_comment,
-                            existing_regions=control_regions,
+                        save_region_from_geometry(
+                            chosen_polygon["geometry"],
+                            str(chosen_polygon["label"]),
+                            chosen_panel,
+                            EXISTING_GEOMETRY_REGION_SOURCE,
                         )
-                        st.session_state.engineering_control_regions = control_regions + [new_region]
-                        mark_project_dirty()
-                        st.success("Soft control region added. Update the map to apply its generated controls.")
-                        st.rerun()
 
         control_table = controls_dataframe(st.session_state.get("engineering_control_points", []))
         if not control_table.empty:
@@ -1275,7 +1677,7 @@ with controls_col:
                 region_table[CONTROL_REGION_COLUMNS],
                 width="stretch",
                 hide_index=True,
-                disabled=["Region_ID", "Property", "Property_Unit", "Generated_Control_Count"],
+                disabled=["Region_ID", "Region_Source", "Property", "Property_Unit", "Generated_Control_Count"],
                 column_config={
                     "Active": st.column_config.CheckboxColumn("Active"),
                     "Target_Value": st.column_config.NumberColumn("Target Value"),
@@ -1295,6 +1697,31 @@ with controls_col:
                     updated_regions.append(normalize_control_region(merged))
                 st.session_state.engineering_control_regions = updated_regions
                 mark_project_dirty()
+            duplicate_region_ids = st.multiselect(
+                "Duplicate Control Regions",
+                region_table["Region_ID"].dropna().astype(str).tolist(),
+                key="engineering_control_region_duplicate_ids",
+            )
+            if st.button("Duplicate Selected Control Regions", width="stretch") and duplicate_region_ids:
+                duplicate_set = set(duplicate_region_ids)
+                existing_regions = [normalize_control_region(region) for region in st.session_state.get("engineering_control_regions", [])]
+                copied_regions = []
+                for region in existing_regions:
+                    if str(region.get("Region_ID")) not in duplicate_set:
+                        continue
+                    copied = normalize_control_region(
+                        {
+                            **region,
+                            "Region_ID": next_region_id(existing_regions + copied_regions),
+                            "Region_Name": f"{region.get('Region_Name') or region.get('Region_ID')} Copy",
+                            "Generated_Control_Count": 0,
+                        }
+                    )
+                    copied_regions.append(copied)
+                if copied_regions:
+                    st.session_state.engineering_control_regions = existing_regions + copied_regions
+                    mark_project_dirty()
+                    st.rerun()
             delete_region_ids = st.multiselect(
                 "Delete Control Regions",
                 region_table["Region_ID"].dropna().astype(str).tolist(),
@@ -1524,6 +1951,91 @@ def current_signature_for_display(generated_map: dict[str, object] | None) -> di
     )
 
 
+context_style = st.session_state.get("style_settings", {})
+context_layer_settings = st.session_state.get("layer_settings", {})
+context_plot_style = plot_style_with_overlay_settings(
+    context_style,
+    context_layer_settings,
+    generated_surface=bool(st.session_state.get("generated_map") or st.session_state.get("generated_layer_maps")),
+)
+context_included_display, context_excluded_display = split_observations_for_display(
+    filtered_with_include,
+    property_col,
+    unit,
+    display_unit,
+)
+try:
+    context_control_selection = control_selection_for_layer(preview_layer, filtered_with_include)
+except ValueError:
+    context_control_selection = None
+context_display_controls = controls_display_frame(
+    context_control_selection,
+    property_col,
+    unit,
+    display_unit,
+)
+context_display_controls = controls_for_overlay(context_display_controls, context_layer_settings)
+context_display_regions = list(getattr(context_control_selection, "regions", []) or [])
+context_polygons = []
+if bool(context_layer_settings.get("show_reservoir_boundary", True)):
+    context_polygons.extend(
+        geometry_polygons_payload(reservoir_boundary_layer, stroke="#0f172a", fill="rgba(15, 23, 42, 0.035)", width=2.0)
+    )
+if bool(context_layer_settings.get("show_panels", True)):
+    context_polygons.extend(
+        geometry_polygons_payload(panel_layer, stroke="#92400e", fill="rgba(146, 64, 14, 0.035)", width=1.5)
+    )
+if bool(context_layer_settings.get("show_custom_layers", True)):
+    for custom_layer in custom_layers:
+        context_polygons.extend(
+            geometry_polygons_payload(custom_layer, stroke="#2563eb", fill="rgba(37, 99, 235, 0.035)", width=1.5)
+        )
+context_lines = []
+if bool(context_layer_settings.get("show_faults", True)):
+    context_lines.extend(geometry_lines_payload(fault_layer, stroke="#b91c1c", width=2.0))
+if bool(context_layer_settings.get("show_custom_layers", True)):
+    for custom_layer in custom_layers:
+        context_lines.extend(geometry_lines_payload(custom_layer, stroke="#2563eb", width=1.5))
+context_points_payload = observation_points_payload(
+    context_included_display,
+    x_col=x_col,
+    y_col=y_col,
+    property_col=property_col,
+    well_col=well_col,
+    layer_col=layer_col,
+    panel_col=mappings.get("panel"),
+    unit=display_unit,
+    is_pressure_map=is_pressure_map,
+    pressure_reference_date=pressure_reference_date,
+)
+context_excluded_points_payload = observation_points_payload(
+    context_excluded_display,
+    x_col=x_col,
+    y_col=y_col,
+    property_col=property_col,
+    well_col=well_col,
+    layer_col=layer_col,
+    panel_col=mappings.get("panel"),
+    unit=display_unit,
+    is_pressure_map=is_pressure_map,
+    pressure_reference_date=pressure_reference_date,
+)
+context_controls_payload = controls_payload(context_display_controls, x_col=x_col, y_col=y_col)
+context_regions_payload = (
+    control_regions_payload(context_display_regions)
+    if bool(context_layer_settings.get("show_control_regions", True))
+    else []
+)
+context_bounds = draw_payload_bounds(
+    context_points_payload,
+    context_excluded_points_payload,
+    context_controls_payload,
+    context_regions_payload,
+    context_polygons,
+    context_lines,
+)
+
+
 with map_col:
     generated_layer_maps = dict(st.session_state.get("generated_layer_maps", {}) or {})
     generated = st.session_state.get("generated_map")
@@ -1542,8 +2054,101 @@ with map_col:
         generated = generated_layer_maps[selected_generated_layer]
         st.session_state.generated_map = generated
 
-    if not generated:
-        st.info("Configure the controls and generate a map to create the first surface.")
+    if st.session_state.get("control_region_drawing_active"):
+        st.subheader("Draw Control Region")
+        draw_result = control_region_drawer(
+            points=context_points_payload,
+            excluded_points=context_excluded_points_payload,
+            controls=context_controls_payload,
+            regions=context_regions_payload,
+            polygons=context_polygons,
+            lines=context_lines,
+            bounds=context_bounds,
+            vertices=st.session_state.get("control_region_draw_vertices", []),
+            coordinate_unit=coordinate_unit_symbol(coordinate_unit),
+            x_label=x_col,
+            y_label=y_col,
+            height=int(context_style.get("height", 720)),
+            key="control_region_drawer_canvas",
+        )
+        if draw_result:
+            event_id = str(draw_result.get("event_id") or "")
+            if event_id and event_id != st.session_state.get("last_control_region_draw_event_id"):
+                st.session_state.last_control_region_draw_event_id = event_id
+                action = str(draw_result.get("action") or "update")
+                vertices = draw_result.get("vertices") or []
+                if action == "cancel":
+                    st.session_state.control_region_drawing_active = False
+                    st.session_state.control_region_draw_vertices = []
+                    st.session_state.pending_control_region_vertices = []
+                elif action == "clear":
+                    st.session_state.control_region_draw_vertices = []
+                    st.session_state.pending_control_region_vertices = []
+                elif action == "finish":
+                    st.session_state.pending_control_region_vertices = vertices
+                    st.session_state.control_region_draw_vertices = vertices
+                    st.session_state.control_region_drawing_active = False
+                else:
+                    st.session_state.control_region_draw_vertices = vertices
+                st.rerun()
+    elif not generated:
+        measured_count = len(context_included_display)
+        control_count = len(context_display_controls)
+        region_count = len(context_display_regions)
+        status_cols = st.columns([1.2, 1, 1, 1])
+        status_cols[0].warning("Map Status: no surface generated")
+        status_cols[1].metric("Preview Layer", preview_layer or UNSPECIFIED_LAYER)
+        status_cols[2].metric("Measured", f"{measured_count:,}")
+        status_cols[3].metric("Controls", f"{control_count:,}")
+        title = context_style.get("title_override") or f"{property_col} Base Map"
+        figure = build_context_map_figure(
+            context_included_display,
+            context_excluded_display,
+            x_col,
+            y_col,
+            property_col,
+            well_col=well_col,
+            hover_columns=generated_hover_columns(mappings),
+            title=title,
+            unit=display_unit,
+            coordinate_unit=coordinate_unit,
+            is_pressure_map=is_pressure_map,
+            map_reference_date=pressure_reference_date,
+            measurement_date_col=mappings.get("measurement_date"),
+            map_reference_date_col=mappings.get("map_reference_date"),
+            style=context_plot_style,
+        )
+        add_geometry_overlays(
+            figure,
+            reservoir_boundary_layer=reservoir_boundary_layer,
+            panel_layer=panel_layer,
+            fault_layer=fault_layer,
+            custom_layers=custom_layers,
+            layer_settings=context_layer_settings,
+            coordinate_unit=coordinate_unit,
+            show_debug_boundary=True,
+        )
+        add_control_region_overlays(
+            figure,
+            context_display_regions,
+            coordinate_unit=coordinate_unit,
+            visible=bool(context_layer_settings.get("show_control_regions", True)),
+        )
+        add_engineering_control_traces(
+            figure,
+            context_display_controls,
+            x_col=x_col,
+            y_col=y_col,
+            property_col=property_col,
+            unit=display_unit,
+            show_manual=bool(context_layer_settings.get("show_engineering_controls", True)),
+            show_region_points=bool(context_layer_settings.get("show_region_control_points", False)),
+        )
+        move_observation_traces_to_top(figure)
+        st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
+        if is_pressure_map and pressure_reference_date:
+            st.metric("Pressure Map Reference Date", format_map_date(pressure_reference_date))
+        st.caption("Property Surface and Contours become available after Generate Map.")
     else:
         display_status = map_status(current_signature_for_display(generated), generated)
         measured_count = int(generated.get("measured_observation_count") or len(generated.get("included_observations", [])))
@@ -1560,6 +2165,7 @@ with map_col:
 
         style = st.session_state.get("style_settings", {})
         layer_settings = st.session_state.get("layer_settings", {})
+        plot_style = plot_style_with_overlay_settings(style, layer_settings, generated_surface=True)
         debug_cols = st.columns(3)
         show_debug_boundary = debug_cols[0].checkbox("Show Reservoir Boundary", value=True, key="debug_show_boundary")
         show_grid_bbox = debug_cols[1].checkbox("Show Grid Bounding Box", value=False, key="debug_show_grid_bbox")
@@ -1649,7 +2255,7 @@ with map_col:
             map_reference_date=generated.get("map_reference_date"),
             measurement_date_col=generated.get("measurement_date_col"),
             map_reference_date_col=generated.get("map_reference_date_col"),
-            style={**style, **layer_settings},
+            style=plot_style,
             surface_label=display_property,
             surface_unit=surface_unit,
         )

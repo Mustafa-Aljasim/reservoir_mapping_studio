@@ -12,6 +12,7 @@ from utils.units import axis_title, coordinate_unit_symbol
 
 
 OBSERVATION_TRACE_NAMES = {
+    "Raw measured points",
     "Included wells",
     "Excluded observations",
     "Engineering controls",
@@ -104,6 +105,118 @@ def _label_text(
         else:
             labels.append(f"{well}<br>{value}" if well else value)
     return labels
+
+
+def build_context_map_figure(
+    included_observations: pd.DataFrame,
+    excluded_observations: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    property_col: str,
+    well_col: str | None = None,
+    hover_columns: list[tuple[str, str]] | None = None,
+    title: str | None = None,
+    unit: str | None = None,
+    coordinate_unit: str | None = None,
+    is_pressure_map: bool = False,
+    map_reference_date=None,
+    measurement_date_col: str | None = None,
+    map_reference_date_col: str | None = None,
+    style: dict | None = None,
+) -> go.Figure:
+    """Build a Cartesian context map before a property surface exists."""
+
+    style = style or {}
+    hover_columns = hover_columns or []
+    observation_label = property_display_name(property_col, unit)
+    x_axis_title = axis_title(x_col, coordinate_unit)
+    y_axis_title = axis_title(y_col, coordinate_unit)
+    figure = go.Figure()
+
+    show_raw_points = bool(style.get("show_raw_points", style.get("show_wells", True)))
+    if show_raw_points and not included_observations.empty:
+        label_mode = str(style.get("well_label_mode", "None"))
+        labels = _label_text(included_observations, property_col, well_col, label_mode)
+        figure.add_trace(
+            go.Scatter(
+                x=pd.to_numeric(included_observations[x_col], errors="coerce"),
+                y=pd.to_numeric(included_observations[y_col], errors="coerce"),
+                mode="markers+text" if labels else "markers",
+                marker={
+                    "size": int(style.get("marker_size", 9)),
+                    "color": "#0F766E",
+                    "opacity": float(style.get("marker_opacity", 0.92)),
+                    "symbol": "circle",
+                    "line": {
+                        "width": 1.5 if bool(style.get("marker_outline", True)) else 0,
+                        "color": "#FFFFFF",
+                    },
+                },
+                text=labels,
+                textposition="top center",
+                textfont={"size": int(style.get("label_text_size", 11)), "color": "#0F172A"},
+                hovertext=_build_hover_text(
+                    included_observations,
+                    x_col,
+                    y_col,
+                    property_col,
+                    observation_label,
+                    well_col,
+                    hover_columns,
+                    coordinate_unit,
+                    is_pressure_map=is_pressure_map,
+                    map_reference_date=map_reference_date,
+                    measurement_date_col=measurement_date_col,
+                    map_reference_date_col=map_reference_date_col,
+                ),
+                hoverinfo="text",
+                name="Raw measured points",
+            )
+        )
+
+    if bool(style.get("show_excluded", True)) and not excluded_observations.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=pd.to_numeric(excluded_observations[x_col], errors="coerce"),
+                y=pd.to_numeric(excluded_observations[y_col], errors="coerce"),
+                mode="markers",
+                marker={
+                    "size": max(int(style.get("marker_size", 9)), 10),
+                    "color": "#6B7280",
+                    "opacity": 0.8,
+                    "symbol": "x",
+                    "line": {"width": 2, "color": "#6B7280"},
+                },
+                hovertext=_build_hover_text(
+                    excluded_observations,
+                    x_col,
+                    y_col,
+                    property_col,
+                    observation_label,
+                    well_col,
+                    hover_columns,
+                    coordinate_unit,
+                    is_pressure_map=is_pressure_map,
+                    map_reference_date=map_reference_date,
+                    measurement_date_col=measurement_date_col,
+                    map_reference_date_col=map_reference_date_col,
+                ),
+                hoverinfo="text",
+                name="Excluded observations",
+            )
+        )
+
+    figure.update_layout(
+        title=title or f"{property_col} Base Map",
+        template="plotly_white",
+        height=int(style.get("height", 720)),
+        margin={"l": 30, "r": 30, "t": 70, "b": 30},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "left", "x": 0},
+        hovermode="closest",
+    )
+    figure.update_xaxes(title_text=x_axis_title, zeroline=False)
+    figure.update_yaxes(title_text=y_axis_title, zeroline=False, scaleanchor="x", scaleratio=1)
+    return figure
 
 
 def build_map_figure(
@@ -216,7 +329,7 @@ def build_map_figure(
                     map_reference_date_col=map_reference_date_col,
                 ),
                 hoverinfo="text",
-                name="Included wells",
+                name="Raw measured points",
             )
         )
 

@@ -8,8 +8,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point, mapping, shape
+from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+from shapely.validation import make_valid
 
 from core.active_data import PANEL_MODE_INDEPENDENT, parse_reference_date, panel_mode_from_legacy
 from core.geometry.compartment import selected_panel_features, selected_panel_union
@@ -22,8 +24,12 @@ CONTROL_TYPE = "Engineering Control"
 MANUAL_CONTROL_SOURCE = "Manual Control Point"
 REGION_CONTROL_SOURCE = "Soft Control Region"
 CONTROL_REGION_TYPE = "Soft Control Region"
+DRAWN_CONTROL_REGION_SOURCE = "Draw Polygon on Map"
+SELECTED_WELLS_REGION_SOURCE = "From Selected Wells"
+EXISTING_GEOMETRY_REGION_SOURCE = "From Existing Geometry"
 REGION_CONTROL_WARNING_THRESHOLD = 1000
 REGION_CONTROL_HARD_LIMIT = 5000
+DRAWN_VERTEX_TOLERANCE = 1e-9
 
 CONTROL_POINT_COLUMNS = [
     "Active",
@@ -44,6 +50,7 @@ CONTROL_REGION_COLUMNS = [
     "Active",
     "Region_ID",
     "Region_Name",
+    "Region_Source",
     "Property",
     "Target_Value",
     "Property_Unit",
@@ -68,6 +75,22 @@ class ControlSelection:
     @property
     def control_count(self) -> int:
         return len(self.dataframe)
+
+
+@dataclass(frozen=True)
+class DrawnControlRegion:
+    geometry: BaseGeometry
+    vertices: tuple[tuple[float, float], ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ControlRegionClipResult:
+    geometry: BaseGeometry
+    warnings: tuple[str, ...] = ()
+    outside_reservoir_fraction: float = 0.0
+    outside_panel_fraction: float = 0.0
+    clipped: bool = False
 
 
 def iso_date_or_blank(value: Any) -> str:
@@ -166,6 +189,7 @@ def normalize_control_region(region: dict[str, Any]) -> dict[str, Any]:
         "Active": bool(region.get("Active", True)),
         "Region_ID": str(region.get("Region_ID") or ""),
         "Region_Name": str(region.get("Region_Name") or ""),
+        "Region_Source": str(region.get("Region_Source") or ""),
         "Geometry": geometry,
         "Property": str(region.get("Property") or ""),
         "Target_Value": pd.to_numeric(pd.Series([region.get("Target_Value")]), errors="coerce").iloc[0],
@@ -196,6 +220,7 @@ def create_control_region(
     control_point_spacing: float = 250.0,
     active: bool = True,
     comment: str = "",
+    region_source: str | None = None,
     region_id: str | None = None,
     existing_regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -203,6 +228,7 @@ def create_control_region(
         {
             "Region_ID": region_id or next_region_id(existing_regions),
             "Region_Name": region_name,
+            "Region_Source": region_source or "",
             "Geometry": geometry,
             "Property": property_name,
             "Target_Value": target_value,
@@ -332,6 +358,199 @@ def create_region_from_wells(
     if hull.is_empty or hull.geom_type not in {"Polygon", "MultiPolygon"}:
         raise ValueError("Selected wells do not form a polygonal control region. Add a buffer or choose different wells.")
     return hull
+
+
+def _same_vertex(first: dict[str, float], second: dict[str, float]) -> bool:
+    return (
+        abs(float(first["X"]) - float(second["X"])) <= DRAWN_VERTEX_TOLERANCE
+        and abs(float(first["Y"]) - float(second["Y"])) <= DRAWN_VERTEX_TOLERANCE
+    )
+
+
+def _vertex_xy(vertex: Any, index: int) -> tuple[Any, Any]:
+    if isinstance(vertex, dict):
+        return vertex.get("X", vertex.get("x")), vertex.get("Y", vertex.get("y"))
+    if isinstance(vertex, (list, tuple)) and len(vertex) >= 2:
+        return vertex[0], vertex[1]
+    raise ValueError(f"Vertex {index} must contain X and Y coordinates.")
+
+
+def normalize_polygon_vertices(vertices: list[Any] | tuple[Any, ...]) -> list[dict[str, float]]:
+    normalized: list[dict[str, float]] = []
+    for index, vertex in enumerate(vertices or [], start=1):
+        raw_x, raw_y = _vertex_xy(vertex, index)
+        x_value = _finite_float(raw_x)
+        y_value = _finite_float(raw_y)
+        if x_value is None or y_value is None:
+            raise ValueError(f"Vertex {index} has non-finite X/Y coordinates.")
+        point = {"X": x_value, "Y": y_value}
+        if normalized and _same_vertex(normalized[-1], point):
+            continue
+        normalized.append(point)
+
+    while len(normalized) > 1 and _same_vertex(normalized[0], normalized[-1]):
+        normalized.pop()
+
+    unique_vertices = {
+        (round(float(vertex["X"]), 8), round(float(vertex["Y"]), 8))
+        for vertex in normalized
+    }
+    if len(unique_vertices) < 3:
+        raise ValueError("A control region polygon requires at least three unique finite vertices.")
+    return normalized
+
+
+def _polygonal_part(geometry: BaseGeometry | None) -> BaseGeometry | None:
+    if geometry is None or geometry.is_empty:
+        return None
+    if geometry.geom_type == "Polygon":
+        return geometry if float(geometry.area) > 0.0 else None
+    if geometry.geom_type == "MultiPolygon":
+        polygons = [polygon for polygon in geometry.geoms if not polygon.is_empty and float(polygon.area) > 0.0]
+        if not polygons:
+            return None
+        return polygons[0] if len(polygons) == 1 else MultiPolygon(polygons)
+    if geometry.geom_type == "GeometryCollection":
+        polygons: list[BaseGeometry] = []
+        for part in geometry.geoms:
+            polygonal = _polygonal_part(part)
+            if polygonal is None:
+                continue
+            if polygonal.geom_type == "MultiPolygon":
+                polygons.extend(polygonal.geoms)
+            else:
+                polygons.append(polygonal)
+        if not polygons:
+            return None
+        return _polygonal_part(unary_union(polygons))
+    return None
+
+
+def _repair_polygonal_geometry(geometry: BaseGeometry) -> BaseGeometry | None:
+    for candidate in (make_valid(geometry), geometry.buffer(0)):
+        polygonal = _polygonal_part(candidate)
+        if polygonal is not None and polygonal.is_valid and float(polygonal.area) > 0.0:
+            return polygonal
+    return None
+
+
+def polygon_from_vertices(vertices: list[Any] | tuple[Any, ...]) -> DrawnControlRegion:
+    normalized = normalize_polygon_vertices(vertices)
+    coordinates = [(vertex["X"], vertex["Y"]) for vertex in normalized]
+    polygon = Polygon(coordinates)
+    warnings: list[str] = []
+    if polygon.is_empty:
+        raise ValueError("Drawn control region has zero usable area.")
+    if not polygon.is_valid:
+        repaired = _repair_polygonal_geometry(polygon)
+        if repaired is None:
+            raise ValueError("Drawn control region has a self-intersection that cannot be safely repaired.")
+        polygon = repaired
+        warnings.append("Drawn control region topology was repaired before saving.")
+    if not np.isfinite(float(polygon.area)) or float(polygon.area) <= 0.0:
+        raise ValueError("Drawn control region has zero usable area.")
+    polygonal = _polygonal_part(polygon)
+    if polygonal is None or polygonal.is_empty or not np.isfinite(float(polygonal.area)) or float(polygonal.area) <= 0.0:
+        raise ValueError("Drawn control region has no usable polygonal area.")
+    return DrawnControlRegion(
+        geometry=polygonal,
+        vertices=tuple((float(vertex["X"]), float(vertex["Y"])) for vertex in normalized),
+        warnings=tuple(warnings),
+    )
+
+
+def _domain_from_layer(layer: GeometryLayer | None) -> BaseGeometry | None:
+    if layer is None or not layer.polygon_features:
+        return None
+    geometry = polygon_union(layer.polygon_features)
+    if geometry is None or geometry.is_empty:
+        return None
+    return geometry
+
+
+def _clip_to_domain(
+    geometry: BaseGeometry,
+    domain: BaseGeometry,
+    domain_name: str,
+) -> tuple[BaseGeometry, float]:
+    before_area = float(geometry.area)
+    if before_area <= 0.0:
+        raise ValueError("Drawn control region has zero usable area.")
+    intersection = geometry.intersection(domain)
+    clipped = _polygonal_part(intersection)
+    if clipped is None or clipped.is_empty or float(clipped.area) <= 0.0:
+        raise ValueError(f"Drawn control region does not overlap the active {domain_name}.")
+    removed_fraction = max(0.0, min(1.0, 1.0 - (float(clipped.area) / before_area)))
+    return clipped, removed_fraction
+
+
+def clip_control_region_to_active_domain(
+    geometry: BaseGeometry,
+    *,
+    reservoir_boundary_layer: GeometryLayer | None = None,
+    panel_layer: GeometryLayer | None = None,
+    selected_panels: list[object] | tuple[object, ...] | None = None,
+) -> ControlRegionClipResult:
+    polygonal = _polygonal_part(geometry)
+    if polygonal is None or polygonal.is_empty or not polygonal.is_valid:
+        raise ValueError("Drawn control region geometry is invalid.")
+
+    working = polygonal
+    warnings: list[str] = []
+    outside_reservoir_fraction = 0.0
+    outside_panel_fraction = 0.0
+
+    reservoir_domain = _domain_from_layer(reservoir_boundary_layer)
+    if reservoir_domain is not None:
+        working, outside_reservoir_fraction = _clip_to_domain(working, reservoir_domain, "reservoir domain")
+        if outside_reservoir_fraction > DRAWN_VERTEX_TOLERANCE:
+            warnings.append(
+                f"{outside_reservoir_fraction:.0%} of the drawn control region is outside the reservoir domain."
+            )
+
+    panel_domain = selected_panel_union(panel_layer, selected_panels) if panel_layer is not None else None
+    if panel_domain is not None and not panel_domain.is_empty:
+        working, outside_panel_fraction = _clip_to_domain(working, panel_domain, "selected panel domain")
+        if outside_panel_fraction > DRAWN_VERTEX_TOLERANCE:
+            warnings.append(
+                f"{outside_panel_fraction:.0%} of the drawn control region is outside the selected panel domain."
+            )
+
+    if working.is_empty or not working.is_valid or float(working.area) <= 0.0:
+        raise ValueError("Drawn control region does not overlap the active spatial domain.")
+
+    return ControlRegionClipResult(
+        geometry=working,
+        warnings=tuple(warnings),
+        outside_reservoir_fraction=float(outside_reservoir_fraction),
+        outside_panel_fraction=float(outside_panel_fraction),
+        clipped=bool(outside_reservoir_fraction > DRAWN_VERTEX_TOLERANCE or outside_panel_fraction > DRAWN_VERTEX_TOLERANCE),
+    )
+
+
+def validate_control_region_parameters(
+    *,
+    target_value: Any,
+    spacing: Any,
+    reservoir_layer: str | None = None,
+    valid_layers: list[str] | tuple[str, ...] | None = None,
+    property_type: str = "Generic",
+    pressure_reference_date: Any = None,
+) -> tuple[float, float, str]:
+    target = _finite_float(target_value)
+    if target is None:
+        raise ValueError("Control region Target Value must be finite.")
+    spacing_value = _finite_float(spacing)
+    if spacing_value is None or spacing_value <= 0:
+        raise ValueError("Control region point spacing must be greater than zero.")
+    layer_value = str(reservoir_layer or "")
+    if valid_layers:
+        valid = [str(layer) for layer in valid_layers]
+        if layer_value not in valid:
+            raise ValueError("Select a valid Reservoir Layer for this control region.")
+    if property_type == "Pressure" and not iso_date_or_blank(pressure_reference_date):
+        raise ValueError("Pressure control regions require a Pressure Map Reference Date.")
+    return float(target), float(spacing_value), layer_value
 
 
 def _regular_points_in_geometry(geometry: BaseGeometry, spacing: float) -> list[Point]:

@@ -72,6 +72,10 @@ def ensure_session_state() -> None:
         "engineering_control_points": [],
         "engineering_control_regions": [],
         "selected_control_region_well_ids": [],
+        "control_region_drawing_active": False,
+        "control_region_draw_vertices": [],
+        "pending_control_region_vertices": [],
+        "last_control_region_draw_event_id": "",
         "geometry_layers": {
             "reservoir_boundary": None,
             "panels": None,
@@ -80,6 +84,8 @@ def ensure_session_state() -> None:
         },
         "layer_settings": {
             "show_surface": True,
+            "show_contours": True,
+            "show_raw_points": True,
             "show_wells": True,
             "show_excluded": True,
             "show_reservoir_boundary": True,
@@ -160,6 +166,10 @@ def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | N
     st.session_state.engineering_control_points = []
     st.session_state.engineering_control_regions = []
     st.session_state.selected_control_region_well_ids = []
+    st.session_state.control_region_drawing_active = False
+    st.session_state.control_region_draw_vertices = []
+    st.session_state.pending_control_region_vertices = []
+    st.session_state.last_control_region_draw_event_id = ""
     st.session_state.current_property = None
     st.session_state.include_state = {}
     st.session_state.generated_map = None
@@ -213,6 +223,10 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
     st.session_state.engineering_control_points = []
     st.session_state.engineering_control_regions = []
     st.session_state.selected_control_region_well_ids = []
+    st.session_state.control_region_drawing_active = False
+    st.session_state.control_region_draw_vertices = []
+    st.session_state.pending_control_region_vertices = []
+    st.session_state.last_control_region_draw_event_id = ""
     st.session_state.geometry_layers = {
         "reservoir_boundary": None,
         "panels": None,
