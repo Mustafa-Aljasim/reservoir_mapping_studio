@@ -58,6 +58,11 @@ def build_map_metadata(
     model_signature_hash: str | None = None,
     reservoir_layer: str | None = None,
     layer_mapping_scope: str | None = None,
+    measured_observation_count: int | None = None,
+    engineering_control_count: int | None = None,
+    control_region_count: int | None = None,
+    control_point_ids: list[object] | tuple[object, ...] | None = None,
+    control_region_ids: list[object] | tuple[object, ...] | None = None,
 ) -> dict[str, object]:
     unit_symbol = coordinate_unit_symbol(coordinate_unit)
     metadata: dict[str, object] = {
@@ -81,6 +86,11 @@ def build_map_metadata(
         "Selected_Layers": ", ".join(str(value) for value in (selected_layers or [])),
         "Reservoir_Layer": reservoir_layer or "",
         "Layer_Mapping_Scope": layer_mapping_scope or "",
+        "Measured_Observation_Count": int(measured_observation_count or 0),
+        "Engineering_Control_Count": int(engineering_control_count or 0),
+        "Control_Region_Count": int(control_region_count or 0),
+        "Control_Point_IDs": ", ".join(str(value) for value in (control_point_ids or [])),
+        "Control_Region_IDs": ", ".join(str(value) for value in (control_region_ids or [])),
         "Variogram_Range_Convention": method_parameters.get("variogram_range_convention", "Practical Range")
         if interpolation_method == "Ordinary Kriging"
         else "",

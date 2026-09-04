@@ -9,6 +9,13 @@ import numpy as np
 from scipy.interpolate import griddata
 
 from core.crs import crs_are_compatible
+from core.pressure_dates import format_map_date
+
+
+PRESSURE_CHANGE_DISABLED_MESSAGE = (
+    "Pressure Change requires two pressure scenarios with different Pressure Map Reference Dates. "
+    "Use Map B - Map A to compare methods or scenarios at the same date."
+)
 
 
 @dataclass(frozen=True)
@@ -192,24 +199,50 @@ def _parse_date(value) -> date | None:
         return None
 
 
+def _is_pressure_scenario(scenario: dict[str, object]) -> bool:
+    property_type = str(scenario.get("property_type") or "").strip().lower()
+    property_name = str(scenario.get("property") or scenario.get("property_col") or "").strip().lower()
+    return bool(scenario.get("is_pressure_map")) or property_type == "pressure" or property_name == "pressure"
+
+
+def pressure_change_allowed(first: dict[str, object], second: dict[str, object]) -> tuple[bool, str]:
+    if not (_is_pressure_scenario(first) and _is_pressure_scenario(second)):
+        return False, PRESSURE_CHANGE_DISABLED_MESSAGE
+    first_date = _parse_date(first.get("pressure_reference_date") or first.get("map_reference_date"))
+    second_date = _parse_date(second.get("pressure_reference_date") or second.get("map_reference_date"))
+    if first_date is None or second_date is None:
+        return False, PRESSURE_CHANGE_DISABLED_MESSAGE
+    if first_date == second_date:
+        return False, PRESSURE_CHANGE_DISABLED_MESSAGE
+    return True, ""
+
+
 def pressure_date_order(first: dict[str, object], second: dict[str, object]) -> tuple[dict[str, object], dict[str, object]] | None:
-    first_date = _parse_date(first.get("pressure_reference_date"))
-    second_date = _parse_date(second.get("pressure_reference_date"))
+    first_date = _parse_date(first.get("pressure_reference_date") or first.get("map_reference_date"))
+    second_date = _parse_date(second.get("pressure_reference_date") or second.get("map_reference_date"))
     if first_date is None or second_date is None:
         return None
     return (first, second) if first_date <= second_date else (second, first)
 
 
 def calculate_pressure_change(first: dict[str, object], second: dict[str, object]) -> DeltaResult:
+    allowed, message = pressure_change_allowed(first, second)
+    if not allowed:
+        raise ValueError(message)
     ordered = pressure_date_order(first, second)
     if ordered is None:
-        raise ValueError("Pressure change requires both maps to have Pressure Map Reference Dates.")
+        raise ValueError(PRESSURE_CHANGE_DISABLED_MESSAGE)
     earlier, later = ordered
-    result = calculate_delta(earlier, later, operation="Pressure Change = Later - Earlier")
+    earlier_date = earlier.get("pressure_reference_date") or earlier.get("map_reference_date") or ""
+    later_date = later.get("pressure_reference_date") or later.get("map_reference_date") or ""
+    label = f"Pressure Change {format_map_date(later_date)} minus {format_map_date(earlier_date)}"
+    result = calculate_delta(earlier, later, operation=label)
     result.metadata["Source_Map_Earlier"] = earlier.get("name")
     result.metadata["Source_Map_Later"] = later.get("name")
-    result.metadata["Date_Earlier"] = earlier.get("pressure_reference_date") or ""
-    result.metadata["Date_Later"] = later.get("pressure_reference_date") or ""
+    result.metadata["Date_Earlier"] = earlier_date
+    result.metadata["Date_Later"] = later_date
+    result.metadata["Pressure_Change_Label"] = label
+    result.metadata["Delta_P_Convention"] = "Later pressure map minus earlier pressure map."
     return result
 
 

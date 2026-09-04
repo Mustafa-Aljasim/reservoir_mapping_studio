@@ -56,6 +56,8 @@ def leave_one_out_cross_validation(
     well_names: list[object] | None = None,
     panels: list[object] | None = None,
     respect_compartments: bool = False,
+    conditioning_points: pd.DataFrame | None = None,
+    conditioning_panels: list[object] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, float | int | None]]:
     """Run fixed-parameter LOOCV.
 
@@ -76,6 +78,14 @@ def leave_one_out_cross_validation(
         panels = [None] * len(working)
     else:
         panels = list(panels[: len(working)]) + [None] * max(0, len(working) - len(panels))
+    conditioning = pd.DataFrame() if conditioning_points is None else conditioning_points.reset_index(drop=True).copy()
+    if conditioning_panels is None:
+        conditioning_panel_labels = [None] * len(conditioning)
+    else:
+        conditioning_panel_labels = list(conditioning_panels[: len(conditioning)]) + [None] * max(
+            0,
+            len(conditioning) - len(conditioning_panels),
+        )
 
     for index, row in working.iterrows():
         train = working.drop(index).copy()
@@ -86,6 +96,16 @@ def leave_one_out_cross_validation(
             else:
                 train_mask = [panel == target_panel and panel_index != index for panel_index, panel in enumerate(panels)]
                 train = working.loc[train_mask].copy()
+        if not conditioning.empty:
+            extra = conditioning
+            if respect_compartments:
+                if target_panel is None:
+                    extra = conditioning.iloc[0:0]
+                else:
+                    control_mask = [panel == target_panel for panel in conditioning_panel_labels]
+                    extra = conditioning.loc[control_mask]
+            if not extra.empty:
+                train = pd.concat([train, extra], ignore_index=True)
         predicted = np.nan
         try:
             if method_key == "idw":

@@ -15,6 +15,7 @@ from core.active_data import (
 )
 from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import prepare_interpolation_dataframe
+from core.engineering_controls import engineering_controls_for_context
 from core.geostatistics.comparison import compare_methods
 from core.geostatistics.validation import leave_one_out_cross_validation
 from core.geostatistics.variogram import (
@@ -178,7 +179,59 @@ if prepared.empty:
     st.warning("No finite included observations are available for geostatistical analysis.")
     st.stop()
 
-st.caption(f"{len(prepared):,} finite included observation(s). Variogram lag distances use {unit_symbol}.")
+control_selection = engineering_controls_for_context(
+    control_points=st.session_state.get("engineering_control_points", []),
+    control_regions=st.session_state.get("engineering_control_regions", []),
+    measured_dataframe=filtered,
+    mappings=mappings,
+    property_col=property_col,
+    property_type=property_type,
+    property_unit=property_unit,
+    pressure_reference_date=pressure_reference_date,
+    reservoir_layer=selected_layer,
+    selected_panels=selected_panels,
+    panel_interpolation_mode=panel_interpolation_mode,
+    x_col=x_col,
+    y_col=y_col,
+    panel_layer=panel_layer,
+    reservoir_boundary_layer=st.session_state.geometry_layers.get("reservoir_boundary"),
+)
+control_prepared = (
+    pd.DataFrame(columns=["X", "Y", "Z"])
+    if control_selection.dataframe.empty
+    else prepare_interpolation_dataframe(
+        control_selection.dataframe,
+        x_col,
+        y_col,
+        property_col,
+        include_col=INCLUDE_COLUMN,
+        duplicate_method=duplicate_method,
+        metadata_columns=[
+            column
+            for column in [
+                well_col,
+                mappings.get("panel"),
+                layer_col,
+                "Control_ID",
+                "Control_Type",
+                "Source_Type",
+                "Region_ID",
+                "Region_Name",
+            ]
+            if column
+        ],
+    )
+)
+
+st.caption(
+    f"{len(prepared):,} finite included measured observation(s); "
+    f"{len(control_prepared):,} engineering control conditioning point(s). "
+    f"Variogram lag distances use {unit_symbol}."
+)
+if len(control_prepared):
+    st.caption("Engineering controls are excluded from experimental variograms, auto-fit, LOOCV targets, and validation metrics.")
+for warning in control_selection.warnings:
+    st.warning(warning)
 
 
 def _current_variogram_context() -> dict[str, object]:
@@ -237,6 +290,21 @@ def prepared_panel_labels() -> list[object]:
         return [None] * len(prepared)
     labels, warnings = assign_prepared_observations_to_panels(
         prepared,
+        panel_layer,
+        selected_panels=selected_panels,
+        dataset_panel_col=mappings.get("panel"),
+    )
+    for warning in warnings:
+        st.warning(warning)
+    return labels.tolist()
+
+
+def conditioning_panel_labels() -> list[object]:
+    panel_layer = st.session_state.geometry_layers.get("panels")
+    if panel_layer is None or control_prepared.empty:
+        return [None] * len(control_prepared)
+    labels, warnings = assign_prepared_observations_to_panels(
+        control_prepared,
         panel_layer,
         selected_panels=selected_panels,
         dataset_panel_col=mappings.get("panel"),
@@ -385,6 +453,7 @@ with validation_tab:
             "angle": params.get("anisotropy_angle", 0.0),
             "ratio": params.get("anisotropy_ratio", 1.0),
         },
+        control_state=control_selection.signature_state,
     )
     if st.button("RUN CROSS VALIDATION", type="primary"):
         well_names = (
@@ -393,6 +462,7 @@ with validation_tab:
             else [f"Obs-{index + 1}" for index in range(len(prepared))]
         )
         panels = prepared_panel_labels() if respect_compartments else None
+        control_panels = conditioning_panel_labels() if respect_compartments else None
         with st.spinner("Running fixed-parameter leave-one-out cross validation..."):
             results, metrics = leave_one_out_cross_validation(
                 prepared,
@@ -401,6 +471,8 @@ with validation_tab:
                 well_names=well_names,
                 panels=panels,
                 respect_compartments=respect_compartments,
+                conditioning_points=control_prepared,
+                conditioning_panels=control_panels,
             )
         st.session_state.geostatistics["cross_validation"] = {
             "results": results,
@@ -470,6 +542,7 @@ with comparison_tab:
             "methods": selected_methods,
             "method_parameters": comparison_params,
         },
+        control_state=control_selection.signature_state,
     )
     if st.button("COMPARE METHODS", type="primary"):
         well_names = (
@@ -478,6 +551,7 @@ with comparison_tab:
             else [f"Obs-{index + 1}" for index in range(len(prepared))]
         )
         panels = prepared_panel_labels() if comparison_respect_compartments else None
+        control_panels = conditioning_panel_labels() if comparison_respect_compartments else None
         with st.spinner("Running method comparison..."):
             comparison = compare_methods(
                 prepared,
@@ -486,6 +560,8 @@ with comparison_tab:
                 well_names=well_names,
                 panels=panels,
                 respect_compartments=comparison_respect_compartments,
+                conditioning_points=control_prepared,
+                conditioning_panels=control_panels,
             )
         st.session_state.geostatistics["method_comparison"] = {
             "results": comparison,

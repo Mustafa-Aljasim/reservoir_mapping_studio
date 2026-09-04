@@ -16,6 +16,12 @@ from core.active_data import panel_mode_from_legacy
 from core.column_mapper import normalize_column_mappings
 from core.crs import normalize_crs_config
 from core.data_loader import add_internal_row_id
+from core.engineering_controls import (
+    deserialize_control_points,
+    deserialize_control_regions,
+    serialize_control_points,
+    serialize_control_regions,
+)
 from core.geometry.loader import load_geojson_bytes
 from core.geometry.models import GeometryLayer
 from core.geostatistics.variogram import ExperimentalVariogram, VariogramFit
@@ -23,8 +29,8 @@ from core.scenarios import json_safe, scenario_metadata
 from utils.constants import INTERNAL_ROW_ID
 
 
-PROJECT_SCHEMA_VERSION = "1.2"
-SUPPORTED_PROJECT_SCHEMA_VERSIONS = {"1.0", "1.1", PROJECT_SCHEMA_VERSION}
+PROJECT_SCHEMA_VERSION = "1.3"
+SUPPORTED_PROJECT_SCHEMA_VERSIONS = {"1.0", "1.1", "1.2", PROJECT_SCHEMA_VERSION}
 
 
 class ProjectArchiveError(ValueError):
@@ -98,12 +104,23 @@ def _write_scenario(archive: zipfile.ZipFile, scenario: dict[str, object]) -> di
     return {"id": scenario_id, "metadata_path": f"{base}.json", "arrays_path": f"{base}.npz"}
 
 
+def _map_result_metadata(map_result: dict[str, object]) -> dict[str, object]:
+    metadata = dict(map_result)
+    metadata["engineering_control_points"] = serialize_control_points(
+        metadata.get("engineering_control_points", [])
+    )
+    metadata["engineering_control_regions"] = serialize_control_regions(
+        metadata.get("engineering_control_regions", [])
+    )
+    return scenario_metadata(metadata)
+
+
 def _write_map_result(
     archive: zipfile.ZipFile,
     map_result: dict[str, object],
     base: str,
 ) -> dict[str, object]:
-    archive.writestr(f"{base}.json", _json_bytes(scenario_metadata(map_result)))
+    archive.writestr(f"{base}.json", _json_bytes(_map_result_metadata(map_result)))
     arrays = {
         "grid_x": np.asarray(map_result["grid_x"], dtype=float),
         "grid_y": np.asarray(map_result["grid_y"], dtype=float),
@@ -213,6 +230,8 @@ def save_project_archive(state: dict[str, object]) -> bytes:
         "active_generated_layer": state.get("active_generated_layer"),
         "generated_layer_statuses": json_safe(state.get("generated_layer_statuses", [])),
         "generated_layer_batch_signature": json_safe(state.get("generated_layer_batch_signature", {})),
+        "engineering_control_points": serialize_control_points(state.get("engineering_control_points", [])),
+        "engineering_control_regions": serialize_control_regions(state.get("engineering_control_regions", [])),
         "crs": normalize_crs_config(state.get("crs", {})),
         "include_state": state.get("include_state", {}),
         "layer_settings": state.get("layer_settings", {}),
@@ -284,6 +303,10 @@ def _read_map_result(
         result["panel_grid"] = None
     result["included_observations"] = _read_optional_csv(archive, f"{base}_included.csv")
     result["excluded_observations"] = _read_optional_csv(archive, f"{base}_excluded.csv")
+    controls = result.get("engineering_controls", [])
+    result["engineering_controls"] = controls if isinstance(controls, pd.DataFrame) else pd.DataFrame(controls)
+    result["engineering_control_points"] = deserialize_control_points(result.get("engineering_control_points", []))
+    result["engineering_control_regions"] = deserialize_control_regions(result.get("engineering_control_regions", []))
     return result
 
 
@@ -326,6 +349,8 @@ def load_project_archive(data: bytes) -> dict[str, object]:
             "generated_layer_maps": {},
             "generated_layer_statuses": manifest.get("generated_layer_statuses", []),
             "generated_layer_batch_signature": manifest.get("generated_layer_batch_signature", {}),
+            "engineering_control_points": deserialize_control_points(manifest.get("engineering_control_points", [])),
+            "engineering_control_regions": deserialize_control_regions(manifest.get("engineering_control_regions", [])),
             "crs": normalize_crs_config(manifest.get("crs", {})),
             "include_state": {int(key): bool(value) for key, value in dict(manifest.get("include_state", {})).items()},
             "layer_settings": manifest.get("layer_settings", {}),

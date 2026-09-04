@@ -41,6 +41,8 @@ def _session_snapshot() -> dict[str, object]:
         "generated_layer_maps",
         "generated_layer_statuses",
         "generated_layer_batch_signature",
+        "engineering_control_points",
+        "engineering_control_regions",
         "crs",
         "include_state",
         "geometry_layers",

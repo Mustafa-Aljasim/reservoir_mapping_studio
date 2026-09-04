@@ -69,6 +69,9 @@ def ensure_session_state() -> None:
         "generated_layer_maps": {},
         "generated_layer_statuses": [],
         "generated_layer_batch_signature": {},
+        "engineering_control_points": [],
+        "engineering_control_regions": [],
+        "selected_control_region_well_ids": [],
         "geometry_layers": {
             "reservoir_boundary": None,
             "panels": None,
@@ -86,6 +89,9 @@ def ensure_session_state() -> None:
             "show_fault_labels": False,
             "show_custom_layers": True,
             "show_custom_labels": False,
+            "show_engineering_controls": True,
+            "show_control_regions": True,
+            "show_region_control_points": False,
             "reservoir_boundary_width": 2.5,
             "panel_boundary_width": 1.5,
             "fault_line_width": 2.0,
@@ -151,6 +157,9 @@ def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | N
     st.session_state.generated_layer_maps = {}
     st.session_state.generated_layer_statuses = []
     st.session_state.generated_layer_batch_signature = {}
+    st.session_state.engineering_control_points = []
+    st.session_state.engineering_control_regions = []
+    st.session_state.selected_control_region_well_ids = []
     st.session_state.current_property = None
     st.session_state.include_state = {}
     st.session_state.generated_map = None
@@ -201,6 +210,9 @@ def reset_workspace_for_new_project(metadata: dict[str, str]) -> None:
     st.session_state.generated_layer_maps = {}
     st.session_state.generated_layer_statuses = []
     st.session_state.generated_layer_batch_signature = {}
+    st.session_state.engineering_control_points = []
+    st.session_state.engineering_control_regions = []
+    st.session_state.selected_control_region_well_ids = []
     st.session_state.geometry_layers = {
         "reservoir_boundary": None,
         "panels": None,

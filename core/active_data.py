@@ -240,6 +240,7 @@ def build_model_signature(
     interpolation_domain: str | None = None,
     domain_bounds: Any = None,
     mask_parameters: dict[str, Any] | None = None,
+    control_state: dict[str, Any] | None = None,
     variogram: dict[str, Any] | None = None,
     anisotropy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -266,6 +267,7 @@ def build_model_signature(
         "mask_parameters": mask_parameters or {},
         "variogram": variogram or {},
         "anisotropy": anisotropy or {},
+        "engineering_controls": control_state or {},
         "control_points": [],
     }
     signature["hash"] = signature_hash(signature)

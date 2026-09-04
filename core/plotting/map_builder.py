@@ -11,7 +11,12 @@ from core.plotting.styling import format_numeric, property_display_name
 from utils.units import axis_title, coordinate_unit_symbol
 
 
-OBSERVATION_TRACE_NAMES = {"Included wells", "Excluded observations"}
+OBSERVATION_TRACE_NAMES = {
+    "Included wells",
+    "Excluded observations",
+    "Engineering controls",
+    "Region controls",
+}
 
 
 def move_observation_traces_to_top(figure: go.Figure) -> None:

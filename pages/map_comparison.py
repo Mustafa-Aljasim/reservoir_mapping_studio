@@ -12,9 +12,11 @@ from core.map_comparison import (
     calculate_pressure_change,
     compatibility_report,
     grid_extent,
+    pressure_change_allowed,
     pressure_date_order,
     symmetric_delta_range,
 )
+from core.pressure_dates import format_map_date
 from core.plotting.map_builder import build_map_figure
 from core.scenarios import create_map_scenario
 from pages.shared import ensure_session_state, mark_project_dirty, project_display_name
@@ -182,10 +184,19 @@ st.markdown("#### Delta / Pressure Change")
 if not report.delta_allowed:
     st.info("Delta calculation is disabled until property, property unit, coordinate unit, and CRS are compatible.")
 else:
-    pressure_ready = bool(map_a.get("is_pressure_map") and map_b.get("is_pressure_map") and pressure_date_order(map_a, map_b))
+    pressure_ready, pressure_message = pressure_change_allowed(map_a, map_b)
     operation_options = ["Map B - Map A"]
+    pressure_label = ""
     if pressure_ready:
-        operation_options.insert(0, "Pressure Change = Later - Earlier")
+        earlier, later = pressure_date_order(map_a, map_b)
+        pressure_label = (
+            f"Pressure Change {format_map_date(later.get('pressure_reference_date') or later.get('map_reference_date'))} "
+            f"minus {format_map_date(earlier.get('pressure_reference_date') or earlier.get('map_reference_date'))}"
+        )
+        operation_options.insert(0, pressure_label)
+        st.caption(pressure_label)
+    else:
+        st.info(pressure_message)
     operation = st.radio("Operation", operation_options, horizontal=True)
     manual_range = st.checkbox("Manual Delta Color Range", value=False)
     if st.button("CALCULATE DELTA MAP", type="primary"):
@@ -193,6 +204,7 @@ else:
             result = calculate_pressure_change(map_a, map_b) if operation.startswith("Pressure Change") else calculate_delta(map_a, map_b)
             metadata = dict(result.metadata)
             metadata["Created_Time"] = pd.Timestamp.utcnow().isoformat()
+            result_title = metadata.get("Pressure_Change_Label") if operation.startswith("Pressure Change") else f"Map B - Map A: {map_b.get('name')} vs {map_a.get('name')}"
             st.session_state.delta_map = {
                 "grid_x": result.grid_x,
                 "grid_y": result.grid_y,
@@ -202,7 +214,7 @@ else:
                 "unit": map_a.get("property_unit") or "",
                 "coordinate_unit": map_a.get("coordinate_unit"),
                 "crs": map_a.get("crs", {}),
-                "title": f"{operation}: {map_b.get('name')} vs {map_a.get('name')}",
+                "title": result_title,
             }
             st.success("Delta map calculated.")
         except ValueError as exc:
@@ -231,7 +243,7 @@ else:
         )
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
         st.caption(f"Grid alignment: {delta['metadata'].get('Grid_Alignment')}")
-        if delta["metadata"].get("Operation") == "Pressure Change = Later - Earlier":
+        if str(delta["metadata"].get("Operation", "")).startswith("Pressure Change"):
             st.caption("Negative pressure change indicates pressure decline.")
 
         grid_df = grid_to_dataframe(delta["grid_x"], delta["grid_y"], delta["grid_z"], "Delta", include_nan=False)

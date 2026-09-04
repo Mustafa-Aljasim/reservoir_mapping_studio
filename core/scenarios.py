@@ -9,8 +9,16 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+from shapely.geometry import mapping
+from shapely.geometry.base import BaseGeometry
 
 from core.active_data import panel_mode_from_legacy
+from core.engineering_controls import (
+    deserialize_control_points,
+    deserialize_control_regions,
+    serialize_control_points,
+    serialize_control_regions,
+)
 from utils.constants import INTERNAL_ROW_ID
 
 
@@ -37,6 +45,8 @@ def json_safe(value):
         return value.item()
     if isinstance(value, pd.DataFrame):
         return value.to_dict(orient="records")
+    if isinstance(value, BaseGeometry):
+        return mapping(value)
     return value
 
 
@@ -80,6 +90,11 @@ def create_map_scenario(
 
     included_observations = generated_map.get("included_observations", pd.DataFrame()).copy()
     excluded_observations = generated_map.get("excluded_observations", pd.DataFrame()).copy()
+    engineering_controls = generated_map.get("engineering_controls", pd.DataFrame())
+    if isinstance(engineering_controls, pd.DataFrame):
+        engineering_controls = engineering_controls.copy()
+    else:
+        engineering_controls = pd.DataFrame(engineering_controls)
     grid_variance = generated_map.get("grid_variance")
     validation_current = _current_validation(generated_map, validation)
     panel_mode = panel_mode_from_legacy(
@@ -127,6 +142,16 @@ def create_map_scenario(
         "excluded_observation_ids": _observation_ids(excluded_observations),
         "crs": json_safe((project_context or {}).get("crs", {})),
         "export_metadata": json_safe(generated_map.get("export_metadata", {})),
+        "measured_observation_count": int(generated_map.get("measured_observation_count", len(included_observations))),
+        "conditioning_observation_count": int(
+            generated_map.get("conditioning_observation_count", len(included_observations) + len(engineering_controls))
+        ),
+        "engineering_control_count": int(generated_map.get("engineering_control_count", len(engineering_controls))),
+        "control_region_count": int(generated_map.get("control_region_count", 0)),
+        "control_warnings": json_safe(generated_map.get("control_warnings", [])),
+        "engineering_controls": engineering_controls,
+        "engineering_control_points": serialize_control_points(generated_map.get("engineering_control_points", [])),
+        "engineering_control_regions": serialize_control_regions(generated_map.get("engineering_control_regions", [])),
         "hover_columns": json_safe(generated_map.get("hover_columns", [])),
         "validation_metrics": json_safe((validation_current or {}).get("metrics", {})),
         "validation_signature": json_safe((validation_current or {}).get("signature", {})),
@@ -149,6 +174,9 @@ def create_map_scenario(
 
 
 def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
+    engineering_controls = scenario.get("engineering_controls", pd.DataFrame())
+    if not isinstance(engineering_controls, pd.DataFrame):
+        engineering_controls = pd.DataFrame(engineering_controls)
     return {
         "grid_x": np.asarray(scenario["grid_x"], dtype=float),
         "grid_y": np.asarray(scenario["grid_y"], dtype=float),
@@ -192,6 +220,16 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "hover_columns": deepcopy(scenario.get("hover_columns", [])),
         "title": scenario.get("title") or scenario.get("name"),
         "export_metadata": deepcopy(scenario.get("export_metadata", {})),
+        "measured_observation_count": int(
+            scenario.get("measured_observation_count", len(scenario.get("included_observations", pd.DataFrame())))
+        ),
+        "conditioning_observation_count": int(scenario.get("conditioning_observation_count", 0)),
+        "engineering_controls": engineering_controls.copy(),
+        "engineering_control_points": deserialize_control_points(scenario.get("engineering_control_points", [])),
+        "engineering_control_regions": deserialize_control_regions(scenario.get("engineering_control_regions", [])),
+        "engineering_control_count": int(scenario.get("engineering_control_count", len(engineering_controls))),
+        "control_region_count": int(scenario.get("control_region_count", 0)),
+        "control_warnings": deepcopy(scenario.get("control_warnings", [])),
         "model_signature": deepcopy(scenario.get("model_signature", {})),
     }
 
@@ -222,6 +260,8 @@ def scenario_summary_table(scenarios: list[dict[str, object]]) -> pd.DataFrame:
                 "Pressure Reference Date": scenario.get("pressure_reference_date") or "",
                 "Reservoir Layer": scenario.get("reservoir_layer") or ", ".join(scenario.get("selected_layers", []) or []),
                 "Grid": _grid_label(scenario),
+                "Controls": scenario.get("engineering_control_count", 0),
+                "Regions": scenario.get("control_region_count", 0),
                 "Created": scenario.get("created_time"),
             }
         )

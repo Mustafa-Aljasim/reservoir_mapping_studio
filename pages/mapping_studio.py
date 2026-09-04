@@ -11,6 +11,20 @@ import streamlit as st
 from core.active_data import prepare_active_property_data
 from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import build_qc_summary, descriptive_statistics, flag_outliers
+from core.engineering_controls import (
+    CONTROL_POINT_COLUMNS,
+    CONTROL_REGION_COLUMNS,
+    assign_panel_from_point,
+    controls_dataframe,
+    controls_for_plot,
+    create_control_point,
+    create_control_region,
+    create_region_from_wells,
+    engineering_controls_for_context,
+    normalize_control_point,
+    normalize_control_region,
+    regions_dataframe,
+)
 from core.filtering import build_filter_column_list
 from core.geometry.assignment import assign_points_to_polygons, outside_panel_count
 from core.geometry.compartment import filter_dataframe_to_selected_panels, selected_panel_bounds
@@ -41,6 +55,7 @@ from core.map_context import build_map_metadata
 from core.masking import auto_maximum_distance
 from core.pressure_dates import format_map_date, summarize_measurement_dates
 from core.plotting.geometry_layers import add_fault_layer, add_polygon_layer
+from core.plotting.engineering_controls import add_control_region_overlays, add_engineering_control_traces
 from core.plotting.map_builder import build_map_figure, move_observation_traces_to_top
 from core.scenarios import (
     create_map_scenario,
@@ -383,6 +398,18 @@ def render_layer_manager() -> dict[str, object]:
     settings["show_surface"] = st.checkbox("Property Surface", value=bool(settings.get("show_surface", True)))
     settings["show_wells"] = st.checkbox("Wells", value=bool(settings.get("show_wells", True)))
     settings["show_excluded"] = st.checkbox("Excluded Wells", value=bool(settings.get("show_excluded", True)))
+    settings["show_engineering_controls"] = st.checkbox(
+        "Engineering Controls",
+        value=bool(settings.get("show_engineering_controls", True)),
+    )
+    settings["show_control_regions"] = st.checkbox(
+        "Control Regions",
+        value=bool(settings.get("show_control_regions", True)),
+    )
+    settings["show_region_control_points"] = st.checkbox(
+        "Generated Region Points",
+        value=bool(settings.get("show_region_control_points", False)),
+    )
     if geometry_layers.get("reservoir_boundary"):
         settings["show_reservoir_boundary"] = st.checkbox(
             "Reservoir Boundary",
@@ -434,6 +461,79 @@ def render_layer_manager() -> dict[str, object]:
     )
     st.session_state.layer_settings = settings
     return settings
+
+
+def finite_default(series, fallback: float = 0.0) -> float:
+    values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(values.mean()) if not values.empty else fallback
+
+
+def data_panel_options(frame: pd.DataFrame, panel_col: str | None) -> list[str]:
+    if not panel_col or panel_col not in frame.columns:
+        return []
+    values = frame[panel_col].dropna().astype(str)
+    values = values[values.str.strip() != ""]
+    return sorted(values.drop_duplicates().tolist(), key=str)
+
+
+def selected_region_geometry_choices(
+    *,
+    reservoir_boundary_layer,
+    panel_layer,
+    custom_layers,
+    selected_panels: list[object] | tuple[object, ...],
+) -> dict[str, dict[str, object]]:
+    choices: dict[str, dict[str, object]] = {}
+    selected_panel_names = {str(value) for value in selected_panels or [] if value not in (None, "")}
+
+    def add_layer(prefix: str, layer, panel_from_feature: bool = False) -> None:
+        if layer is None:
+            return
+        for index, feature in enumerate(layer.polygon_features):
+            geometry = feature.geometry
+            if geometry.is_empty or not geometry.is_valid:
+                continue
+            if panel_from_feature and selected_panel_names and str(feature.name) not in selected_panel_names:
+                continue
+            key = f"{prefix}:{index}"
+            choices[key] = {
+                "label": f"{layer.name} - {feature.name}",
+                "geometry": geometry,
+                "panel": str(feature.name) if panel_from_feature else "",
+            }
+
+    add_layer("reservoir", reservoir_boundary_layer)
+    add_layer("panel", panel_layer, panel_from_feature=True)
+    for custom_index, custom_layer in enumerate(custom_layers or []):
+        add_layer(f"custom-{custom_index}", custom_layer)
+    return choices
+
+
+def well_seed_options(frame: pd.DataFrame, well_col: str | None, x_col: str, y_col: str) -> dict[str, str]:
+    options: dict[str, str] = {}
+    if frame.empty:
+        return options
+    for index, row in frame.iterrows():
+        row_id = row.get(INTERNAL_ROW_ID, index)
+        key = str(row_id)
+        well_name = row.get(well_col) if well_col and well_col in frame.columns else f"Row {key}"
+        x_value = pd.to_numeric(pd.Series([row.get(x_col)]), errors="coerce").iloc[0]
+        y_value = pd.to_numeric(pd.Series([row.get(y_col)]), errors="coerce").iloc[0]
+        x_label = "" if pd.isna(x_value) else f"{float(x_value):.6g}"
+        y_label = "" if pd.isna(y_value) else f"{float(y_value):.6g}"
+        options[key] = f"{well_name} ({x_label}, {y_label})"
+    return options
+
+
+def controls_display_frame(selection, property_col: str, source_unit: str | None, display_unit: str | None) -> pd.DataFrame:
+    frame = controls_for_plot(selection)
+    if frame.empty:
+        return frame
+    if property_col not in frame.columns:
+        frame[property_col] = pd.to_numeric(frame["Value"], errors="coerce")
+    frame = convert_observations_for_display(frame, property_col, source_unit, display_unit)
+    frame["Value"] = frame[property_col]
+    return frame
 
 
 def statuses_frame(statuses: list[object] | tuple[object, ...]) -> pd.DataFrame:
@@ -805,6 +905,26 @@ def prepare_observations_for_layer(reservoir_layer: str | None) -> tuple[pd.Data
     )
 
 
+def control_selection_for_layer(reservoir_layer: str | None, measured_dataframe: pd.DataFrame):
+    return engineering_controls_for_context(
+        control_points=st.session_state.get("engineering_control_points", []),
+        control_regions=st.session_state.get("engineering_control_regions", []),
+        measured_dataframe=measured_dataframe,
+        mappings=mappings,
+        property_col=property_col,
+        property_type=property_type,
+        property_unit=unit,
+        pressure_reference_date=pressure_reference_date,
+        reservoir_layer=None if reservoir_layer in (None, UNSPECIFIED_LAYER) else str(reservoir_layer),
+        selected_panels=selected_panels,
+        panel_interpolation_mode=panel_interpolation_mode,
+        x_col=x_col,
+        y_col=y_col,
+        panel_layer=panel_layer,
+        reservoir_boundary_layer=reservoir_boundary_layer,
+    )
+
+
 preview_layer = observation_layer_for_controls()
 filtered_with_include, prepared = prepare_observations_for_layer(preview_layer)
 filtered_with_include = flag_outliers(filtered_with_include, property_col)
@@ -935,6 +1055,272 @@ with controls_col:
             st.plotly_chart(histogram, width="stretch")
 
 with controls_col:
+    with st.expander("Engineering Controls", expanded=False):
+        controls_scope_layer = preview_layer if has_layer_column else None
+        controls_reference_date = pressure_reference_date if is_pressure_map else None
+        if has_layer_column:
+            st.caption(f"Control layer scope: {controls_scope_layer or 'None'}")
+        if is_pressure_map:
+            if controls_reference_date:
+                st.caption(f"Control pressure date: {format_map_date(controls_reference_date)}")
+            else:
+                st.warning("Pressure controls added now will have no reference date and will be excluded until a reference date is selected.")
+
+        control_points = list(st.session_state.get("engineering_control_points", []))
+        control_regions = list(st.session_state.get("engineering_control_regions", []))
+        default_x = finite_default(filtered_with_include[x_col], 0.0) if x_col in filtered_with_include else 0.0
+        default_y = finite_default(filtered_with_include[y_col], 0.0) if y_col in filtered_with_include else 0.0
+        default_value = finite_default(filtered_with_include[property_col], 0.0) if property_col in filtered_with_include else 0.0
+        panel_options = data_panel_options(active_for_layers if not active_for_layers.empty else df, mappings.get("panel"))
+
+        point_tab, region_tab = st.tabs(["Point", "Region"])
+        with point_tab:
+            point_cols = st.columns(3)
+            control_x = point_cols[0].number_input("Control X", value=default_x, key="engineering_control_x")
+            control_y = point_cols[1].number_input("Control Y", value=default_y, key="engineering_control_y")
+            control_value = point_cols[2].number_input("Control Value", value=default_value, key="engineering_control_value")
+            manual_panel = ""
+            if panel_layer is not None and panel_layer.polygon_features:
+                manual_panel, panel_warning = assign_panel_from_point(
+                    float(control_x),
+                    float(control_y),
+                    panel_layer,
+                    selected_panels,
+                )
+                if manual_panel:
+                    st.caption(f"Assigned panel: {manual_panel}")
+                elif panel_warning:
+                    st.warning(panel_warning)
+            elif panel_options:
+                manual_panel = st.selectbox("Control Panel", [""] + panel_options, key="engineering_control_panel")
+            control_active = st.checkbox("Active Control", value=True, key="engineering_control_active")
+            control_comment = st.text_input("Control Comment", key="engineering_control_comment")
+            if st.button("Add Control Point", type="primary", width="stretch"):
+                new_control = create_control_point(
+                    x=float(control_x),
+                    y=float(control_y),
+                    property_name=property_col,
+                    value=float(control_value),
+                    property_unit=unit,
+                    reservoir_layer=controls_scope_layer,
+                    panel=manual_panel or "",
+                    pressure_reference_date=controls_reference_date,
+                    active=control_active,
+                    comment=control_comment,
+                    existing_controls=control_points,
+                )
+                st.session_state.engineering_control_points = control_points + [new_control]
+                mark_project_dirty()
+                st.success("Engineering control point added. Update the map to apply it.")
+                st.rerun()
+
+        with region_tab:
+            region_source = st.radio(
+                "Region Source",
+                ["Selected Wells Convex Hull", "Existing Polygon"],
+                horizontal=True,
+                key="engineering_control_region_source",
+            )
+            region_name = st.text_input("Region Name", key="engineering_control_region_name")
+            region_cols = st.columns(3)
+            region_target = region_cols[0].number_input(
+                "Target Value",
+                value=default_value,
+                key="engineering_control_region_target",
+            )
+            region_spacing = region_cols[1].number_input(
+                f"Point Spacing ({coordinate_unit_symbol(coordinate_unit)})",
+                min_value=0.000001,
+                value=250.0,
+                key="engineering_control_region_spacing",
+            )
+            region_active = region_cols[2].checkbox("Active Region", value=True, key="engineering_control_region_active")
+            region_panel = ""
+            if panel_layer is not None and panel_layer.polygon_features and len(selected_panels) == 1:
+                region_panel = str(selected_panels[0])
+            elif panel_layer is None and panel_options:
+                region_panel = st.selectbox("Region Panel", [""] + panel_options, key="engineering_control_region_panel")
+            region_comment = st.text_input("Region Comment", key="engineering_control_region_comment")
+
+            if region_source == "Selected Wells Convex Hull":
+                buffer_distance = st.number_input(
+                    f"Hull Buffer ({coordinate_unit_symbol(coordinate_unit)})",
+                    min_value=0.0,
+                    value=0.0,
+                    key="engineering_control_region_buffer",
+                )
+                seed_frame = included.copy()
+                seed_options = well_seed_options(seed_frame, well_col, x_col, y_col)
+                valid_seed_ids = set(seed_options)
+                st.session_state.selected_control_region_well_ids = [
+                    value for value in st.session_state.get("selected_control_region_well_ids", []) if value in valid_seed_ids
+                ]
+                selected_seed_ids = st.multiselect(
+                    "Seed Wells",
+                    options=list(seed_options),
+                    format_func=lambda value: seed_options.get(value, value),
+                    key="selected_control_region_well_ids",
+                )
+                if st.button("Create Region From Wells", type="primary", width="stretch"):
+                    if len(selected_seed_ids) < 3:
+                        st.error("Select at least three included wells.")
+                    else:
+                        seed_frame = seed_frame.copy()
+                        seed_frame["_Seed_Key"] = [
+                            str(row.get(INTERNAL_ROW_ID, index)) for index, row in seed_frame.iterrows()
+                        ]
+                        selected_wells = seed_frame[seed_frame["_Seed_Key"].isin(selected_seed_ids)]
+                        try:
+                            geometry = create_region_from_wells(selected_wells, x_col, y_col, float(buffer_distance))
+                            new_region = create_control_region(
+                                region_name=region_name or "Well Hull Control Region",
+                                geometry=geometry,
+                                property_name=property_col,
+                                target_value=float(region_target),
+                                property_unit=unit,
+                                reservoir_layer=controls_scope_layer,
+                                panel=region_panel,
+                                pressure_reference_date=controls_reference_date,
+                                control_point_spacing=float(region_spacing),
+                                active=region_active,
+                                comment=region_comment,
+                                existing_regions=control_regions,
+                            )
+                            st.session_state.engineering_control_regions = control_regions + [new_region]
+                            mark_project_dirty()
+                            st.success("Soft control region added. Update the map to apply its generated controls.")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.error(str(exc))
+            else:
+                polygon_choices = selected_region_geometry_choices(
+                    reservoir_boundary_layer=reservoir_boundary_layer,
+                    panel_layer=panel_layer,
+                    custom_layers=custom_layers,
+                    selected_panels=selected_panels,
+                )
+                if not polygon_choices:
+                    st.caption("No valid polygon geometry is loaded.")
+                else:
+                    selected_polygon_key = st.selectbox(
+                        "Polygon",
+                        options=list(polygon_choices),
+                        format_func=lambda value: str(polygon_choices[value]["label"]),
+                        key="engineering_control_polygon_choice",
+                    )
+                    chosen_polygon = polygon_choices[selected_polygon_key]
+                    chosen_panel = str(chosen_polygon.get("panel") or region_panel or "")
+                    if chosen_panel:
+                        st.caption(f"Region panel scope: {chosen_panel}")
+                    if st.button("Create Region From Polygon", type="primary", width="stretch"):
+                        new_region = create_control_region(
+                            region_name=region_name or str(chosen_polygon["label"]),
+                            geometry=chosen_polygon["geometry"],
+                            property_name=property_col,
+                            target_value=float(region_target),
+                            property_unit=unit,
+                            reservoir_layer=controls_scope_layer,
+                            panel=chosen_panel,
+                            pressure_reference_date=controls_reference_date,
+                            control_point_spacing=float(region_spacing),
+                            active=region_active,
+                            comment=region_comment,
+                            existing_regions=control_regions,
+                        )
+                        st.session_state.engineering_control_regions = control_regions + [new_region]
+                        mark_project_dirty()
+                        st.success("Soft control region added. Update the map to apply its generated controls.")
+                        st.rerun()
+
+        control_table = controls_dataframe(st.session_state.get("engineering_control_points", []))
+        if not control_table.empty:
+            edited_controls = st.data_editor(
+                control_table[CONTROL_POINT_COLUMNS],
+                width="stretch",
+                hide_index=True,
+                disabled=["Control_ID", "Property", "Property_Unit", "Source_Type"],
+                column_config={
+                    "Active": st.column_config.CheckboxColumn("Active"),
+                    "X": st.column_config.NumberColumn("X"),
+                    "Y": st.column_config.NumberColumn("Y"),
+                    "Value": st.column_config.NumberColumn("Value"),
+                },
+                key="engineering_control_point_editor",
+            )
+            if not edited_controls.equals(control_table[CONTROL_POINT_COLUMNS]):
+                st.session_state.engineering_control_points = [
+                    normalize_control_point(row.to_dict()) for _, row in edited_controls.iterrows()
+                ]
+                mark_project_dirty()
+            delete_control_ids = st.multiselect(
+                "Delete Control Points",
+                control_table["Control_ID"].dropna().astype(str).tolist(),
+                key="engineering_control_delete_ids",
+            )
+            if st.button("Delete Selected Control Points", width="stretch") and delete_control_ids:
+                delete_set = set(delete_control_ids)
+                st.session_state.engineering_control_points = [
+                    control
+                    for control in st.session_state.get("engineering_control_points", [])
+                    if str(control.get("Control_ID")) not in delete_set
+                ]
+                mark_project_dirty()
+                st.rerun()
+        else:
+            st.caption("No manual engineering control points.")
+
+        region_table = regions_dataframe(st.session_state.get("engineering_control_regions", []))
+        if not region_table.empty:
+            edited_regions = st.data_editor(
+                region_table[CONTROL_REGION_COLUMNS],
+                width="stretch",
+                hide_index=True,
+                disabled=["Region_ID", "Property", "Property_Unit", "Generated_Control_Count"],
+                column_config={
+                    "Active": st.column_config.CheckboxColumn("Active"),
+                    "Target_Value": st.column_config.NumberColumn("Target Value"),
+                    "Control_Point_Spacing": st.column_config.NumberColumn("Spacing"),
+                },
+                key="engineering_control_region_editor",
+            )
+            if not edited_regions.equals(region_table[CONTROL_REGION_COLUMNS]):
+                existing_regions = {
+                    str(region.get("Region_ID")): normalize_control_region(region)
+                    for region in st.session_state.get("engineering_control_regions", [])
+                }
+                updated_regions = []
+                for _, row in edited_regions.iterrows():
+                    region_id = str(row.get("Region_ID") or "")
+                    merged = {**existing_regions.get(region_id, {}), **row.to_dict()}
+                    updated_regions.append(normalize_control_region(merged))
+                st.session_state.engineering_control_regions = updated_regions
+                mark_project_dirty()
+            delete_region_ids = st.multiselect(
+                "Delete Control Regions",
+                region_table["Region_ID"].dropna().astype(str).tolist(),
+                key="engineering_control_region_delete_ids",
+            )
+            if st.button("Delete Selected Control Regions", width="stretch") and delete_region_ids:
+                delete_set = set(delete_region_ids)
+                st.session_state.engineering_control_regions = [
+                    region
+                    for region in st.session_state.get("engineering_control_regions", [])
+                    if str(region.get("Region_ID")) not in delete_set
+                ]
+                mark_project_dirty()
+                st.rerun()
+        else:
+            st.caption("No soft control regions.")
+
+        preview_control_selection = control_selection_for_layer(controls_scope_layer, filtered_with_include)
+        st.caption(
+            f"{preview_control_selection.control_count:,} active matching engineering control point(s); "
+            f"{len(preview_control_selection.regions):,} active matching control region(s)."
+        )
+        for warning in preview_control_selection.warnings:
+            st.warning(warning)
+
+with controls_col:
     with st.expander("Interpolation", expanded=True):
         duplicate_default = st.session_state.get("mapping_duplicate_method", DUPLICATE_METHODS[0])
         duplicate_index = DUPLICATE_METHODS.index(duplicate_default) if duplicate_default in DUPLICATE_METHODS else 0
@@ -992,7 +1378,16 @@ with controls_col:
             st.caption("The selected panel union bounds will be interpolated before panel or reservoir masks are applied.")
         if method in {"Linear", "Cubic"} and interpolation_domain == "Reservoir Boundary Extent":
             st.info("Linear and Cubic interpolation may remain NaN outside the convex hull of the observations.")
-        st.caption(f"{len(prepared):,} finite included observation(s) will participate after duplicate handling.")
+        interpolation_control_selection = control_selection_for_layer(preview_layer, filtered_with_include)
+        st.caption(
+            f"{len(prepared):,} finite included measured observation(s) and "
+            f"{interpolation_control_selection.control_count:,} active matching engineering control(s) "
+            "will participate after duplicate handling."
+        )
+        if method == "Ordinary Kriging" and interpolation_control_selection.control_count:
+            st.caption("Ordinary Kriging variogram fitting remains measured-only; controls condition the kriging estimate.")
+        for warning in interpolation_control_selection.warnings:
+            st.warning(warning)
 
         button_label = "GENERATE ALL LAYER MAPS" if layer_scope == LAYER_SCOPE_ALL else "GENERATE MAP"
         if st.session_state.get("generated_map") is not None:
@@ -1036,6 +1431,8 @@ with controls_col:
                             crs=st.session_state.get("crs", {}),
                             panel_layer=panel_layer,
                             reservoir_boundary_layer=reservoir_boundary_layer,
+                            control_points=st.session_state.get("engineering_control_points", []),
+                            control_regions=st.session_state.get("engineering_control_regions", []),
                             fault_layer_loaded=fault_layer is not None,
                             custom_layer_count=len(custom_layers),
                             x_col=x_col,
@@ -1102,7 +1499,8 @@ def current_signature_for_display(generated_map: dict[str, object] | None) -> di
         )
     except ValueError:
         return None
-    if signature_prepared.empty:
+    signature_control_selection = control_selection_for_layer(signature_layer, signature_filtered)
+    if signature_prepared.empty and signature_control_selection.dataframe.empty:
         return None
     signature_parameters = resolve_layer_method_parameters(method, method_parameters, signature_prepared)
     return build_layer_model_signature(
@@ -1122,6 +1520,7 @@ def current_signature_for_display(generated_map: dict[str, object] | None) -> di
         interpolation_domain=interpolation_domain,
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
+        control_state=signature_control_selection.signature_state,
     )
 
 
@@ -1147,12 +1546,17 @@ with map_col:
         st.info("Configure the controls and generate a map to create the first surface.")
     else:
         display_status = map_status(current_signature_for_display(generated), generated)
-        status_cols = st.columns([1.2, 1, 1, 1])
+        measured_count = int(generated.get("measured_observation_count") or len(generated.get("included_observations", [])))
+        engineering_control_count = int(generated.get("engineering_control_count") or 0)
+        control_region_count = int(generated.get("control_region_count") or 0)
+        status_cols = st.columns([1.2, 1, 1, 1, 1, 1])
         with status_cols[0]:
             render_status(display_status)
         status_cols[1].metric("Layer Scope", generated.get("layer_mapping_scope") or LAYER_SCOPE_SELECTED)
         status_cols[2].metric("Reservoir Layer", generated.get("reservoir_layer") or UNSPECIFIED_LAYER)
-        status_cols[3].metric("Included Wells", f"{len(generated.get('included_observations', [])):,}")
+        status_cols[3].metric("Measured", f"{measured_count:,}")
+        status_cols[4].metric("Controls", f"{engineering_control_count:,}")
+        status_cols[5].metric("Regions", f"{control_region_count:,}")
 
         style = st.session_state.get("style_settings", {})
         layer_settings = st.session_state.get("layer_settings", {})
@@ -1194,6 +1598,38 @@ with map_col:
                 display_grid = np.sqrt(np.maximum(generated["grid_variance"], 0.0))
                 display_property = f"{generated['property_col']} Kriging Std Dev"
                 surface_unit = source_unit
+
+        try:
+            plot_control_selection = control_selection_for_layer(
+                generated.get("reservoir_layer"),
+                generated.get("included_observations", pd.DataFrame()),
+            )
+        except ValueError:
+            plot_control_selection = None
+        display_controls = controls_display_frame(
+            plot_control_selection,
+            generated["property_col"],
+            source_unit,
+            display_unit,
+        )
+        display_regions = list(getattr(plot_control_selection, "regions", []) or [])
+        if display_controls.empty:
+            saved_controls = generated.get("engineering_controls", pd.DataFrame())
+            if not isinstance(saved_controls, pd.DataFrame):
+                saved_controls = pd.DataFrame(saved_controls)
+            if not saved_controls.empty:
+                display_controls = saved_controls.copy()
+                if generated["property_col"] not in display_controls.columns and "Value" in display_controls.columns:
+                    display_controls[generated["property_col"]] = pd.to_numeric(display_controls["Value"], errors="coerce")
+                display_controls = convert_observations_for_display(
+                    display_controls,
+                    generated["property_col"],
+                    source_unit,
+                    display_unit,
+                )
+                if generated["property_col"] in display_controls.columns:
+                    display_controls["Value"] = display_controls[generated["property_col"]]
+                display_regions = list(generated.get("engineering_control_regions", []) or [])
 
         figure = build_map_figure(
             generated["grid_x"],
@@ -1253,6 +1689,22 @@ with map_col:
             coordinate_unit=display_coordinate_unit,
             show_debug_boundary=show_debug_boundary,
         )
+        add_control_region_overlays(
+            figure,
+            display_regions,
+            coordinate_unit=display_coordinate_unit,
+            visible=bool(layer_settings.get("show_control_regions", True)),
+        )
+        add_engineering_control_traces(
+            figure,
+            display_controls,
+            x_col=generated["x_col"],
+            y_col=generated["y_col"],
+            property_col=generated["property_col"],
+            unit=display_unit,
+            show_manual=bool(layer_settings.get("show_engineering_controls", True)),
+            show_region_points=bool(layer_settings.get("show_region_control_points", False)),
+        )
         move_observation_traces_to_top(figure)
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
 
@@ -1269,6 +1721,10 @@ with map_col:
             st.caption("Panel Interpolation Mode: Independent by Panel / Compartment.")
         elif generated.get("selected_panels"):
             st.caption("Panel Interpolation Mode: Combined Selected Panels.")
+        if generated.get("control_warnings"):
+            with st.expander("Engineering Control QC", expanded=False):
+                for warning in generated.get("control_warnings", []):
+                    st.warning(warning)
 
         with st.expander("Spatial Domain Diagnostics", expanded=False):
             st.write(f"Well extent: {extent_text(diagnostics.get('well_extent'))}")
@@ -1418,6 +1874,9 @@ with controls_col:
         generated = st.session_state.get("generated_map")
         if generated:
             export_coordinate_unit = st.session_state.get("coordinate_unit", generated.get("coordinate_unit"))
+            engineering_control_export = generated.get("engineering_controls", pd.DataFrame())
+            if not isinstance(engineering_control_export, pd.DataFrame):
+                engineering_control_export = pd.DataFrame(engineering_control_export)
             export_metadata = build_map_metadata(
                 generated["property_col"],
                 generated.get("unit"),
@@ -1452,6 +1911,18 @@ with controls_col:
                 model_signature_hash=(generated.get("model_signature") or {}).get("hash", ""),
                 reservoir_layer=generated.get("reservoir_layer"),
                 layer_mapping_scope=generated.get("layer_mapping_scope"),
+                measured_observation_count=generated.get(
+                    "measured_observation_count",
+                    len(generated.get("included_observations", [])),
+                ),
+                engineering_control_count=generated.get("engineering_control_count", len(engineering_control_export)),
+                control_region_count=generated.get("control_region_count", 0),
+                control_point_ids=engineering_control_export.get("Control_ID", pd.Series(dtype=object)).dropna().tolist()
+                if not engineering_control_export.empty
+                else [],
+                control_region_ids=[
+                    region.get("Region_ID") for region in generated.get("engineering_control_regions", []) or []
+                ],
             )
             metadata_summary = [
                 f"Property: {generated['property_col']}",
@@ -1463,6 +1934,22 @@ with controls_col:
             if generated.get("is_pressure_map") and generated.get("map_reference_date"):
                 metadata_summary.append(f"Reference Date: {format_map_date(generated.get('map_reference_date'))}")
             st.caption(" | ".join(metadata_summary))
+            if not engineering_control_export.empty:
+                controls_export_cols = st.columns(2)
+                controls_export_cols[0].download_button(
+                    "Download Engineering Controls CSV",
+                    dataframe_to_csv_bytes(engineering_control_export),
+                    file_name="engineering_controls.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+                controls_export_cols[1].download_button(
+                    "Download Engineering Controls Excel",
+                    dataframe_to_excel_bytes(engineering_control_export, "Engineering Controls"),
+                    file_name="engineering_controls.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
             include_nan = st.checkbox("Include masked cells in grid export", value=False)
             grid_export = grid_to_dataframe(
                 generated["grid_x"],

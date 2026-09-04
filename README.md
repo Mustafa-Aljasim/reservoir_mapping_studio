@@ -1,6 +1,6 @@
 # Reservoir Mapping Studio
 
-Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic interpolation, panel-aware masking, Reservoir Layer selection, all-layer map batches, Ordinary Kriging, geometry layers, project persistence, saved map scenarios, side-by-side map comparison, delta maps, and pressure-change workflows while keeping the app focused on engineering use rather than geoscience research tooling.
+Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic interpolation, engineering control points, soft control regions, panel-aware masking, Reservoir Layer selection, all-layer map batches, Ordinary Kriging, geometry layers, project persistence, saved map scenarios, side-by-side map comparison, delta maps, and pressure-change workflows while keeping the app focused on engineering use rather than geoscience research tooling.
 
 ## Installation
 
@@ -54,6 +54,7 @@ The archive stores:
 - filters and included/excluded states
 - geometry layers
 - interpolation settings
+- engineering control points and soft control regions
 - selected Reservoir Layer scope and generated layer maps
 - variogram settings
 - saved map scenarios
@@ -63,7 +64,7 @@ This gives a reproducible engineering workspace without relying on Python pickle
 
 ## Saved Maps and Map Library
 
-Use the Map Library to save, rename, duplicate, delete, and reopen map scenarios. Each saved map keeps the computational definition of the generated surface, including the property, reference date, grid definition, interpolation method, mask details, geometry metadata, and style settings.
+Use the Map Library to save, rename, duplicate, delete, and reopen map scenarios. Each saved map keeps the computational definition of the generated surface, including the property, reference date, grid definition, interpolation method, engineering controls used for conditioning, mask details, geometry metadata, and style settings.
 
 ## Reservoir Layers
 
@@ -77,6 +78,21 @@ Mapping Studio supports:
 - Map status: generated maps show whether computational inputs are up to date or stale.
 
 Panel selection is applied before layer splitting. In combined panel mode, each layer map pools observations from the selected panels. In independent panel mode, each layer map respects panel/compartment boundaries.
+
+## Engineering Controls
+
+Engineering controls are explicit conditioning inputs supplied by the engineer. They are not measured observations and are stored/exported separately from the well observation tables.
+
+Mapping Studio supports:
+
+- manual engineering control points with active/inactive status, panel/date/layer/property scope, and comments
+- automatic panel assignment from panel polygons, or manual panel selection when only a data panel column exists
+- soft control regions from selected-well convex hulls with optional buffer, or from loaded polygon geometry
+- generated region control points on a regular internal spacing constrained to the region and selected panels
+- distinct map overlays for Engineering Controls, Control Regions, and optional Generated Region Points
+- QC warnings for duplicate controls, measured-well conflicts, overlapping regions with different targets, outside-boundary controls, wrong layer/panel/date scope, missing pressure dates, and non-finite values
+
+All interpolation methods use active matching controls as conditioning points only after Generate/Update is pressed. Adding, editing, toggling, or deleting controls changes the model signature and marks existing maps stale.
 
 ## Map Comparison and Delta Maps
 
@@ -95,10 +111,10 @@ Delta output follows the rule:
 Map B - Map A
 ```
 
-Pressure change uses the date semantics already established by the application:
+Pressure change is available only when both saved maps are pressure maps with valid, different pressure map reference dates. The app orders the two maps by date regardless of Map A / Map B selection and labels the result explicitly:
 
 ```text
-Pressure Change = Later - Earlier
+Pressure Change 01-Jan-2026 minus 01-Jan-2025
 ```
 
 Negative values indicate pressure decline.
@@ -142,13 +158,14 @@ Supported methods include:
 - RBF
 - Ordinary Kriging
 
-The geostatistics workflow includes experimental variogram analysis, model fitting, anisotropy, kriging uncertainty, validation metrics, and residual diagnostics.
+The geostatistics workflow includes experimental variogram analysis, model fitting, anisotropy, kriging uncertainty, validation metrics, and residual diagnostics. Engineering controls condition kriging estimates and validation predictions, but they are excluded from experimental variograms, variogram auto-fit, LOOCV target sets, and validation metrics.
 
 ## Exports
 
 The app supports:
 
 - CSV and Excel exports
+- separate engineering-control CSV and Excel exports
 - map image exports in PNG, SVG, and PDF
 - XYZ ASCII export
 - metadata JSON export
@@ -240,10 +257,10 @@ python -m compileall .
 python -m pytest -q
 ```
 
-The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, stale map signatures, and project persistence.
+The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, stale map signatures, engineering control scoping/conditioning/persistence, pressure-change guards, and project persistence.
 
 ## Current Limitations
 
-This level does not implement Universal Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, mathematical barrier Kriging, CRS transformations, 3D geostatistics, GeoTIFF export, Petrel/ZMAP export, database connections, pressure datum-depth correction, or temporal pressure extrapolation.
+This level does not implement Universal Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, mathematical barrier Kriging, CRS transformations, 3D geostatistics, GeoTIFF expansion beyond the existing EPSG-gated grid export, Petrel/ZMAP export, database connections, pressure datum-depth correction, or temporal pressure extrapolation.
 
 Static map image export is still left to the Plotly mode bar/browser workflow rather than a dedicated server-side image export dependency.

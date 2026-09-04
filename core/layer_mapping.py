@@ -18,6 +18,7 @@ from core.active_data import (
     signatures_match,
 )
 from core.data_qc import prepare_interpolation_dataframe
+from core.engineering_controls import engineering_controls_for_context
 from core.geometry.compartment import (
     compartment_interpolate,
     filter_dataframe_to_selected_panels,
@@ -339,6 +340,7 @@ def build_layer_model_signature(
     interpolation_domain: str,
     domain_bounds,
     mask_parameters: dict[str, object],
+    control_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     selected_layers = [] if reservoir_layer is None else [str(reservoir_layer)]
     variogram = {
@@ -367,6 +369,7 @@ def build_layer_model_signature(
         interpolation_domain=interpolation_domain,
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
+        control_state=control_state,
         variogram=variogram,
         anisotropy={
             "enabled": interpolation_parameters.get("anisotropy_enabled", False),
@@ -446,6 +449,8 @@ def generate_single_layer_map(
     crs: dict[str, object] | None,
     panel_layer: GeometryLayer | None = None,
     reservoir_boundary_layer: GeometryLayer | None = None,
+    control_points: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
+    control_regions: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
     fault_layer_loaded: bool = False,
     custom_layer_count: int = 0,
     x_col: str = "X",
@@ -472,11 +477,56 @@ def generate_single_layer_map(
     )
     layer_name = str(reservoir_layer) if reservoir_layer is not None else UNSPECIFIED_LAYER
     minimum = _minimum_observations(interpolation_method, interpolation_parameters)
-    if len(prepared) < minimum:
-        raise ValueError(f"{layer_name} has insufficient data ({len(prepared)} available, {minimum} required).")
+    control_selection = engineering_controls_for_context(
+        control_points=control_points,
+        control_regions=control_regions,
+        measured_dataframe=filtered_with_include,
+        mappings=mappings,
+        property_col=property_column,
+        property_type=property_type,
+        property_unit=property_unit or "",
+        pressure_reference_date=pressure_reference_date,
+        reservoir_layer=reservoir_layer,
+        selected_panels=selected_panels,
+        panel_interpolation_mode=panel_interpolation_mode,
+        x_col=x_col,
+        y_col=y_col,
+        panel_layer=panel_layer,
+        reservoir_boundary_layer=reservoir_boundary_layer,
+    )
+    conditioning_input = filtered_with_include.copy()
+    if not control_selection.dataframe.empty:
+        conditioning_input = pd.concat([conditioning_input, control_selection.dataframe], ignore_index=True, sort=False)
+    conditioning_prepared = prepare_interpolation_dataframe(
+        conditioning_input,
+        x_col,
+        y_col,
+        property_column,
+        include_col=INCLUDE_COLUMN,
+        duplicate_method=duplicate_method,
+        metadata_columns=[
+            column
+            for column in [
+                well_col,
+                mappings.get("panel"),
+                layer_column(mappings),
+                "Control_ID",
+                "Control_Type",
+                "Source_Type",
+                "Region_ID",
+                "Region_Name",
+            ]
+            if column
+        ],
+        row_id_col=INTERNAL_ROW_ID,
+    )
+    if len(conditioning_prepared) < minimum:
+        raise ValueError(
+            f"{layer_name} has insufficient data ({len(conditioning_prepared)} available, {minimum} required)."
+        )
     layer_parameters = resolve_layer_method_parameters(interpolation_method, interpolation_parameters, prepared)
     grid_x, grid_y, grid_z, grid_variance, panel_grid, mask_info = _interpolate_layer_surface(
-        prepared,
+        conditioning_prepared,
         interpolation_method,
         layer_parameters,
         grid_parameters,
@@ -509,6 +559,7 @@ def generate_single_layer_map(
         interpolation_domain=interpolation_domain,
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
+        control_state=control_selection.signature_state,
     )
 
     reservoir_geometry = polygon_union(reservoir_boundary_layer.polygon_features) if reservoir_boundary_layer else None
@@ -560,6 +611,13 @@ def generate_single_layer_map(
         model_signature_hash=signature["hash"],
         reservoir_layer=reservoir_layer,
         layer_mapping_scope=normalize_layer_scope(layer_mapping_scope),
+        measured_observation_count=int((filtered_with_include[INCLUDE_COLUMN]).sum()),
+        engineering_control_count=control_selection.control_count,
+        control_region_count=len(control_selection.regions),
+        control_point_ids=control_selection.dataframe.get("Control_ID", pd.Series(dtype=object)).dropna().tolist()
+        if not control_selection.dataframe.empty
+        else [],
+        control_region_ids=[region.get("Region_ID") for region in control_selection.regions],
     )
     title = build_default_map_title(
         property_column,
@@ -600,6 +658,14 @@ def generate_single_layer_map(
         "panel_grid": panel_grid,
         "included_observations": included,
         "excluded_observations": excluded,
+        "engineering_controls": control_selection.dataframe.copy(),
+        "engineering_control_points": control_selection.manual_points,
+        "engineering_control_regions": control_selection.regions,
+        "engineering_control_count": control_selection.control_count,
+        "control_region_count": len(control_selection.regions),
+        "control_warnings": list(control_selection.warnings),
+        "measured_observation_count": int(len(included)),
+        "conditioning_observation_count": int(len(conditioning_prepared)),
         "property_col": property_column,
         "unit": property_unit or "",
         "x_col": x_col,
@@ -656,6 +722,7 @@ def build_batch_signature(
     interpolation_domain: str,
     domain_bounds,
     active_dataframe: pd.DataFrame | None = None,
+    control_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return build_model_signature(
         property_column=property_column,
@@ -676,6 +743,7 @@ def build_batch_signature(
         interpolation_domain=interpolation_domain,
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
+        control_state=control_state,
     )
 
 
@@ -704,6 +772,8 @@ def generate_layer_map_collection(
     crs: dict[str, object] | None,
     panel_layer: GeometryLayer | None = None,
     reservoir_boundary_layer: GeometryLayer | None = None,
+    control_points: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
+    control_regions: list[dict[str, object]] | tuple[dict[str, object], ...] | None = None,
     fault_layer_loaded: bool = False,
     custom_layer_count: int = 0,
     x_col: str = "X",
@@ -783,6 +853,8 @@ def generate_layer_map_collection(
                 crs=crs,
                 panel_layer=panel_layer,
                 reservoir_boundary_layer=reservoir_boundary_layer,
+                control_points=control_points,
+                control_regions=control_regions,
                 fault_layer_loaded=fault_layer_loaded,
                 custom_layer_count=custom_layer_count,
                 x_col=x_col,
@@ -815,6 +887,10 @@ def generate_layer_map_collection(
         x_col=x_col,
         y_col=y_col,
     )
+    batch_control_state = {
+        layer_name: map_result.get("model_signature", {}).get("engineering_controls", {})
+        for layer_name, map_result in maps.items()
+    }
     batch_signature = build_batch_signature(
         layer_scope=scope,
         requested_layers=requested_layers,
@@ -832,6 +908,7 @@ def generate_layer_map_collection(
         interpolation_domain=interpolation_domain,
         domain_bounds=resolve_domain_bounds(interpolation_domain, reservoir_boundary_layer, panel_layer, selected_panels),
         active_dataframe=batch_active_dataframe,
+        control_state=batch_control_state,
     )
     return LayerMapCollection(maps=maps, statuses=tuple(statuses), active_layer=active_layer, batch_signature=batch_signature)
 

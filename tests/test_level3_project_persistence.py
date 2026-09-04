@@ -13,7 +13,7 @@ from core.geostatistics.variogram import (
     ExperimentalVariogram,
     VariogramFit,
 )
-from core.map_comparison import calculate_delta, calculate_pressure_change
+from core.map_comparison import calculate_delta, calculate_pressure_change, pressure_change_allowed
 from core.project_io import load_project_archive, save_project_archive
 from core.scenarios import create_map_scenario
 from utils.constants import INCLUDE_COLUMN, INTERNAL_ROW_ID
@@ -180,7 +180,54 @@ def test_delta_map_and_pressure_change_are_correct():
     assert np.allclose(pressure_change.grid_z, -200.0)
     assert pressure_change.metadata["Date_A"] == "2025-01-01"
     assert pressure_change.metadata["Date_B"] == "2026-01-01"
-    assert pressure_change.metadata["Operation"] == "Pressure Change = Later - Earlier"
+    assert pressure_change.metadata["Operation"] == "Pressure Change 01-Jan-2026 minus 01-Jan-2025"
+    assert pressure_change.metadata["Delta_P_Convention"] == "Later pressure map minus earlier pressure map."
+
+
+def test_pressure_change_disabled_for_same_reference_date_but_generic_delta_still_works():
+    map_a = {
+        "name": "Pressure A",
+        "property": "Pressure",
+        "property_unit": "psi",
+        "coordinate_unit": "m",
+        "crs": {"mode": "Local / Unknown XY"},
+        "grid_x": np.array([[0.0, 1.0], [0.0, 1.0]], dtype=float),
+        "grid_y": np.array([[0.0, 0.0], [1.0, 1.0]], dtype=float),
+        "grid_z": np.full((2, 2), 3000.0),
+        "pressure_reference_date": "2026-01-01",
+        "property_type": "Pressure",
+    }
+    map_b = {**map_a, "name": "Pressure B", "grid_z": np.full((2, 2), 2990.0)}
+
+    allowed, message = pressure_change_allowed(map_a, map_b)
+    generic_delta = calculate_delta(map_a, map_b)
+
+    assert not allowed
+    assert "different Pressure Map Reference Dates" in message
+    assert np.allclose(generic_delta.grid_z, -10.0)
+
+
+def test_pressure_change_orders_dates_regardless_map_dropdown_order():
+    later = {
+        "name": "Later",
+        "property": "Pressure",
+        "property_type": "Pressure",
+        "property_unit": "psi",
+        "coordinate_unit": "m",
+        "crs": {"mode": "Local / Unknown XY"},
+        "grid_x": np.array([[0.0, 1.0], [0.0, 1.0]], dtype=float),
+        "grid_y": np.array([[0.0, 0.0], [1.0, 1.0]], dtype=float),
+        "grid_z": np.full((2, 2), 2900.0),
+        "pressure_reference_date": "2026-01-01",
+    }
+    earlier = {**later, "name": "Earlier", "grid_z": np.full((2, 2), 3000.0), "pressure_reference_date": "2025-01-01"}
+
+    result = calculate_pressure_change(later, earlier)
+
+    assert np.allclose(result.grid_z, -100.0)
+    assert result.metadata["Source_Map_Earlier"] == "Earlier"
+    assert result.metadata["Source_Map_Later"] == "Later"
+    assert result.metadata["Pressure_Change_Label"] == "Pressure Change 01-Jan-2026 minus 01-Jan-2025"
 
 
 def test_scenario_snapshot_is_immutable_after_generated_map_mutation():
