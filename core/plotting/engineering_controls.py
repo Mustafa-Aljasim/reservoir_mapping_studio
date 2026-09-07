@@ -19,7 +19,7 @@ CONTROL_REGION_TRACE = "Control regions"
 
 def _control_hover(row, property_col: str, unit: str | None) -> str:
     control_id = row.get("Control_ID", "")
-    source_type = row.get("Source_Type", "Manual Control Point")
+    source_type = row.get("Source_Type", "Manual Entry")
     value = row.get(property_col, row.get("Value"))
     lines = [
         f"Control: {control_id}",
@@ -61,7 +61,7 @@ def add_engineering_control_traces(
     if y_col not in working.columns and "Y" in working.columns:
         working[y_col] = working["Y"]
 
-    source = working.get("Source_Type", pd.Series("", index=working.index)).astype(str)
+    source = working.get("Source_Type", pd.Series("", index=working.index)).astype(str).replace({"Soft Control Region": REGION_CONTROL_SOURCE})
     trace_groups = [
         (working[source != REGION_CONTROL_SOURCE], ENGINEERING_CONTROL_TRACE, "diamond", "#F97316", show_manual),
         (working[source == REGION_CONTROL_SOURCE], REGION_CONTROL_TRACE, "diamond-open", "#7C3AED", show_region_points),

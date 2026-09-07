@@ -12,7 +12,7 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-from core.crs import LOCAL_CRS_MODE, normalize_crs_config
+from core.crs import LOCAL_CRS_MODE, normalize_crs_config, map_crs_snapshot, crs_are_compatible
 from core.engineering_controls import serialize_control_regions
 from core.scenarios import json_safe
 from utils.constants import APP_NAME
@@ -328,13 +328,17 @@ def _metadata_seed(map_result: dict[str, object]) -> dict[str, object]:
 
 
 def _crs_from_map_result(map_result: dict[str, object], seed: dict[str, object] | None = None) -> dict[str, object]:
-    if map_result.get("crs"):
-        return _coerce_crs(map_result.get("crs"))
-    seed = seed or _metadata_seed(map_result)
-    epsg = seed.get("CRS_EPSG") or seed.get("EPSG")
-    if epsg not in (None, ""):
-        return _coerce_crs({"mode": seed.get("CRS_Mode") or "Custom EPSG", "epsg": epsg})
-    return normalize_crs_config(None)
+    return map_crs_snapshot(map_result)
+
+
+def _export_crs(map_result: dict[str, object], scenario: dict[str, object] | None) -> dict[str, object]:
+    crs = _crs_from_map_result(map_result)
+    if scenario is not None:
+        saved_crs = map_crs_snapshot(scenario)
+        if not crs_are_compatible(crs, saved_crs):
+            raise ValueError("Map and saved scenario CRS disagree. Export the saved scenario's map.")
+        return saved_crs
+    return crs
 
 
 def _iso_text(value) -> str:
@@ -488,7 +492,7 @@ def build_map_export_metadata(
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
     seed = _metadata_seed(map_result)
-    crs = _crs_from_map_result(map_result, seed)
+    crs = _export_crs(map_result, scenario)
     grid_definition = regular_grid_definition(map_result["grid_x"], map_result["grid_y"])
     metadata = dict(seed)
     property_name = str(map_result.get("property_col") or map_result.get("property") or metadata.get("Property") or "Value")
@@ -776,7 +780,7 @@ def map_geotiff_export_files(
     nodata: float = GEOTIFF_NODATA,
 ) -> list[tuple[str, bytes, dict[str, object]]]:
     files: list[tuple[str, bytes, dict[str, object]]] = []
-    crs = _crs_from_map_result(map_result)
+    crs = _export_crs(map_result, scenario)
     for value_export in value_exports_for_map(map_result, include_uncertainty=include_uncertainty):
         metadata = build_map_export_metadata(
             map_result,

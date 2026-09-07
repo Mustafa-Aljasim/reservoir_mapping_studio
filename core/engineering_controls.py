@@ -21,8 +21,8 @@ from utils.constants import INCLUDE_COLUMN
 
 
 CONTROL_TYPE = "Engineering Control"
-MANUAL_CONTROL_SOURCE = "Manual Control Point"
-REGION_CONTROL_SOURCE = "Soft Control Region"
+MANUAL_CONTROL_SOURCE = "Manual Entry"
+REGION_CONTROL_SOURCE = "Region Generated"
 CONTROL_REGION_TYPE = "Soft Control Region"
 DRAWN_CONTROL_REGION_SOURCE = "Draw Polygon on Map"
 SELECTED_WELLS_REGION_SOURCE = "From Selected Wells"
@@ -121,6 +121,7 @@ def normalize_control_point(control: dict[str, Any]) -> dict[str, Any]:
     normalized["Control_ID"] = str(normalized.get("Control_ID") or "")
     normalized["Active"] = bool(normalized.get("Active", True))
     normalized["Source_Type"] = str(normalized.get("Source_Type") or MANUAL_CONTROL_SOURCE)
+    normalized["Source_Type"] = {"Manual Control Point": MANUAL_CONTROL_SOURCE, "Soft Control Region": REGION_CONTROL_SOURCE}.get(normalized["Source_Type"], normalized["Source_Type"])
     normalized["Property"] = str(normalized.get("Property") or "")
     normalized["Property_Unit"] = str(normalized.get("Property_Unit") or "")
     normalized["Reservoir_Layer"] = str(normalized.get("Reservoir_Layer") or "")

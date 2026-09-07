@@ -152,6 +152,9 @@ def ensure_session_state() -> None:
 
 
 def set_active_dataframe(df: pd.DataFrame, source_name: str, source_key: str | None = None) -> None:
+    for key in ("pending_control_point_pick", "control_point_preview", "last_control_point_pick_event"):
+        st.session_state.pop(key, None)
+    st.session_state.control_point_picking_active = False
     clean = normalize_columns(df)
     st.session_state.original_df = clean.copy()
     st.session_state.working_df = add_internal_row_id(clean)

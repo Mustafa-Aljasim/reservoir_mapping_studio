@@ -209,7 +209,8 @@ def test_all_layers_receive_only_matching_layer_controls():
     assert collection.maps["Lower"]["engineering_controls"]["Control_ID"].tolist() == ["CP-L"]
 
 
-def test_ordinary_kriging_auto_fit_uses_measured_observations_only():
+@pytest.mark.parametrize("source_type", ["Manual Entry", "Map Pick", "File Import"])
+def test_ordinary_kriging_auto_fit_uses_measured_observations_only(source_type):
     dataframe = _layer_frame()
     controls = [
         create_control_point(x=0.25, y=0.75, property_name="Pressure", value=9000.0, property_unit="psi", reservoir_layer="Upper", panel="A", pressure_reference_date="2026-01-01", control_id="CP-HIGH"),
@@ -222,6 +223,7 @@ def test_ordinary_kriging_auto_fit_uses_measured_observations_only():
         "variance": 1.0,
         "nugget": 0.0,
     }
+    controls[0]["Source_Type"] = source_type
     filtered, measured_prepared = prepare_layer_observations(
         dataframe=dataframe,
         mappings=MAPPINGS,

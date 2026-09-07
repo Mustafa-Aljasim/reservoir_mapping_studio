@@ -378,6 +378,7 @@
       (args.excluded_points || []).forEach((point) => drawMarker(point, { symbol: "x", size: 5, fill: "#6b7280", stroke: "#6b7280", lineWidth: 2 }));
       (args.controls || []).forEach((point) => drawMarker(point, { symbol: "diamond", size: 6, fill: point.region_id ? "#ffffff" : "#f97316", stroke: point.region_id ? "#7c3aed" : "#111827", lineWidth: 2 }));
       drawVertices();
+      if (args.preview_point) drawMarker(args.preview_point, {symbol: "diamond", size: 8, fill: "#fef08a", stroke: "#111827", lineWidth: 2});
       readout.textContent = `Vertices: ${vertices.length}`;
       undoBtn.disabled = vertices.length === 0;
       clearBtn.disabled = vertices.length === 0;
@@ -415,6 +416,13 @@
       if (!drawingStarted) return;
       const world = toWorld(event.clientX, event.clientY);
       if (!Number.isFinite(world.x) || !Number.isFinite(world.y)) return;
+      if (args.mode === "single_point_pick") {
+        drawingStarted = false;
+        args.preview_point = world;
+        draw();
+        Streamlit.setComponentValue({action: "pick", x: world.x, y: world.y, event_id: `${Date.now()}-${++eventSeq}`});
+        return;
+      }
       vertices.push({ x: world.x, y: world.y });
       statusEl.textContent = `Added vertex ${vertices.length}: X ${formatNumber(world.x)}, Y ${formatNumber(world.y)} ${args.coordinate_unit || ""}`;
       draw();
@@ -465,6 +473,10 @@
       const data = event.data || {};
       if (data.type !== "streamlit:render") return;
       args = data.args || {};
+      const pointMode = args.mode === "single_point_pick";
+      [undoBtn, clearBtn, finishBtn].forEach(button => button.style.display = pointMode ? "none" : "");
+      startBtn.textContent = pointMode ? "PICK CONTROL LOCATION" : "Start Drawing";
+      statusEl.textContent = pointMode ? "Click a location on the map." : "Click the canvas to add Cartesian X/Y vertices.";
       vertices = (args.vertices || []).map(pointFrom).filter(Boolean);
       const height = Number(args.height) || 620;
       Streamlit.setFrameHeight(height);

@@ -10,6 +10,7 @@ import streamlit as st
 from shapely.geometry.base import BaseGeometry
 
 from components.control_region_drawer import control_region_drawer
+from core.control_import import FIELDS, read_control_file, suggest_control_columns, preview_control_import, apply_pending_pick
 from core.active_data import prepare_active_property_data
 from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import build_qc_summary, descriptive_statistics, flag_outliers
@@ -45,7 +46,7 @@ from core.geostatistics.variogram import (
     compute_experimental_variogram,
     fit_candidate_models,
 )
-from core.crs import crs_coordinate_unit_warning, crs_display_name
+from core.crs import crs_coordinate_unit_warning, crs_display_name, crs_are_compatible
 from core.interpolation.rbf import estimate_epsilon
 from core.layer_mapping import (
     DOMAIN_RESERVOIR_BOUNDARY_EXTENT,
@@ -766,7 +767,7 @@ def controls_payload(controls: pd.DataFrame, *, x_col: str, y_col: str) -> list[
 def controls_for_overlay(controls: pd.DataFrame, layer_settings: dict[str, object]) -> pd.DataFrame:
     if controls is None or controls.empty:
         return pd.DataFrame()
-    source = controls.get("Source_Type", pd.Series("", index=controls.index)).astype(str)
+    source = controls.get("Source_Type", pd.Series("", index=controls.index)).astype(str).replace({"Soft Control Region": REGION_CONTROL_SOURCE})
     manual_keep = (source != REGION_CONTROL_SOURCE) & bool(layer_settings.get("show_engineering_controls", True))
     region_keep = (source == REGION_CONTROL_SOURCE) & bool(layer_settings.get("show_region_control_points", False))
     return controls.loc[manual_keep | region_keep].copy()
@@ -1388,6 +1389,19 @@ with controls_col:
 
         point_tab, region_tab = st.tabs(["Point", "Region"])
         with point_tab:
+            apply_pending_pick(st.session_state)
+            location_mode = st.radio("Control Location", ["Enter Coordinates", "Pick on Map"], key="control_location_mode")
+            if location_mode == "Pick on Map":
+                if st.button("PICK CONTROL LOCATION", width="stretch"):
+                    st.session_state.control_point_picking_active = True
+                    st.session_state.control_region_drawing_active = False
+                if st.session_state.get("control_point_picking_active"):
+                    st.info("Click a location on the map.")
+                preview = st.session_state.get("control_point_preview")
+                if preview:
+                    st.caption(f"Selected Location — X: {preview['x']} {coordinate_unit_symbol(coordinate_unit)}, Y: {preview['y']} {coordinate_unit_symbol(coordinate_unit)}")
+            else:
+                st.session_state.control_point_picking_active = False
             point_cols = st.columns(3)
             control_x = point_cols[0].number_input("Control X", value=default_x, key="engineering_control_x")
             control_y = point_cols[1].number_input("Control Y", value=default_y, key="engineering_control_y")
@@ -1404,6 +1418,7 @@ with controls_col:
                     st.caption(f"Assigned panel: {manual_panel}")
                 elif panel_warning:
                     st.warning(panel_warning)
+                    manual_panel = st.selectbox("Control Panel", [""] + [str(feature.name) for feature in panel_layer.polygon_features], key="engineering_control_panel_resolution")
             elif panel_options:
                 manual_panel = st.selectbox("Control Panel", [""] + panel_options, key="engineering_control_panel")
             control_active = st.checkbox("Active Control", value=True, key="engineering_control_active")
@@ -1421,11 +1436,48 @@ with controls_col:
                     active=control_active,
                     comment=control_comment,
                     existing_controls=control_points,
+                    source_type="Map Pick" if location_mode == "Pick on Map" and st.session_state.get("control_point_preview") == {"x": float(control_x), "y": float(control_y)} else "Manual Entry",
                 )
                 st.session_state.engineering_control_points = control_points + [new_control]
+                st.session_state.pop("control_point_preview", None)
                 mark_project_dirty()
                 st.success("Engineering control point added. Update the map to apply it.")
                 st.rerun()
+
+            with st.expander("Import Control Points"):
+                upload = st.file_uploader("Control point file", type=["csv", "xlsx"], key="control_point_upload")
+                if upload is not None:
+                    try:
+                        import_frame = read_control_file(upload.getvalue(), upload.name)
+                        suggested = suggest_control_columns(import_frame.columns)
+                        import_columns = {}
+                        for field in FIELDS:
+                            choices = [None] + list(import_frame.columns)
+                            import_columns[field] = st.selectbox(f"Import {field}", choices,
+                                index=choices.index(suggested[field]), format_func=lambda col: "Not supplied / default" if col is None else str(col),
+                                key=f"control_import_{field}_{upload.name}")
+                        defaults = {"Property": property_col, "Layer": controls_scope_layer or "", "Unit": unit,
+                                    "Pressure_Reference_Date": controls_reference_date or "", "Active": True}
+                        st.write("Defaults for missing columns:", defaults)
+                        st.caption("Panel Assignment: file field" if import_columns["Panel"] else "Panel Assignment: spatial where polygon geometry exists")
+                        known_panels = sorted(set(data_panel_options(df, mappings.get("panel"))) | {str(feature.name) for feature in (panel_layer.polygon_features if panel_layer else [])})
+                        imported, import_errors, import_warnings = preview_control_import(import_frame, import_columns,
+                            defaults=defaults, valid_properties=property_options, valid_layers=reservoir_layer_values(df, mappings) if has_layer_column else [],
+                            valid_panels=known_panels, existing_controls=control_points, panel_layer=panel_layer,
+                            reservoir_boundary_layer=reservoir_boundary_layer, measured_dataframe=attach_include_column(df), mappings=mappings,
+                            pressure_properties=[prop for prop in property_options if st.session_state.get(f"property_type_{prop}", "Pressure" if is_pressure_property(prop) else "Generic") == "Pressure"])
+                        st.write(f"Control Points to Import: {len(imported)}")
+                        st.dataframe(controls_dataframe(imported), hide_index=True, width="stretch")
+                        for error in import_errors:
+                            st.error(error)
+                        for warning in import_warnings:
+                            st.warning(warning)
+                        if st.button("IMPORT CONTROL POINTS", disabled=bool(import_errors) or not imported):
+                            st.session_state.engineering_control_points = control_points + imported
+                            mark_project_dirty()
+                            st.rerun()
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        st.error(f"Cannot import control file: {exc}")
 
         with region_tab:
             source_options = [
@@ -1711,7 +1763,7 @@ with controls_col:
                 mark_project_dirty()
                 st.rerun()
         else:
-            st.caption("No manual engineering control points.")
+            st.caption("No engineering control points.")
 
         region_table = regions_dataframe(st.session_state.get("engineering_control_regions", []))
         if not region_table.empty:
@@ -1997,6 +2049,7 @@ def current_signature_for_display(generated_map: dict[str, object] | None) -> di
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
         control_state=signature_control_selection.signature_state,
+        crs=st.session_state.get("crs"),
     )
 
 
@@ -2089,6 +2142,8 @@ current_plot_figure = None
 with map_col:
     generated_layer_maps = dict(st.session_state.get("generated_layer_maps", {}) or {})
     generated = st.session_state.get("generated_map")
+    if generated and not crs_are_compatible(generated.get("crs"), st.session_state.get("crs")):
+        st.info(f"This map uses {crs_display_name(generated.get('crs'))}; export will preserve the map/scenario CRS. Update the map to use the current Project CRS. No reprojection occurs.")
     if generated_layer_maps:
         layer_keys = list(generated_layer_maps)
         current_layer_key = st.session_state.get("active_generated_layer")
@@ -2104,7 +2159,21 @@ with map_col:
         generated = generated_layer_maps[selected_generated_layer]
         st.session_state.generated_map = generated
 
-    if st.session_state.get("control_region_drawing_active"):
+    if st.session_state.get("control_point_picking_active"):
+        st.subheader("Pick Control Location")
+        pick_result = control_region_drawer(points=context_points_payload, excluded_points=context_excluded_points_payload,
+            controls=context_controls_payload, regions=context_regions_payload, polygons=context_polygons,
+            lines=context_lines, bounds=context_bounds, coordinate_unit=coordinate_unit_symbol(coordinate_unit),
+            mode="single_point_pick", preview_point=st.session_state.get("control_point_preview"), key="control_point_picker_canvas")
+        if pick_result and pick_result.get("event_id") != st.session_state.get("last_control_point_pick_event"):
+            st.session_state.last_control_point_pick_event = pick_result.get("event_id")
+            if pick_result.get("action") == "pick":
+                st.session_state.pending_control_point_pick = {"x": pick_result["x"], "y": pick_result["y"]}
+                st.session_state.control_point_picking_active = False
+            elif pick_result.get("action") == "cancel":
+                st.session_state.control_point_picking_active = False
+            st.rerun()
+    elif st.session_state.get("control_region_drawing_active"):
         st.subheader("Draw Control Region")
         draw_result = control_region_drawer(
             points=context_points_payload,
@@ -2195,6 +2264,10 @@ with map_col:
             show_region_points=bool(context_layer_settings.get("show_region_control_points", False)),
         )
         move_observation_traces_to_top(figure)
+        preview_point = st.session_state.get("control_point_preview")
+        if preview_point:
+            figure.add_trace(go.Scatter(x=[preview_point["x"]], y=[preview_point["y"]], mode="markers",
+                name="Control location preview", marker={"symbol": "diamond", "size": 15, "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
         current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
         if is_pressure_map and pressure_reference_date:
@@ -2363,6 +2436,10 @@ with map_col:
             show_region_points=bool(layer_settings.get("show_region_control_points", False)),
         )
         move_observation_traces_to_top(figure)
+        preview_point = st.session_state.get("control_point_preview")
+        if preview_point:
+            figure.add_trace(go.Scatter(x=[preview_point["x"]], y=[preview_point["y"]], mode="markers",
+                name="Control location preview", marker={"symbol": "diamond", "size": 15, "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
         current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
 

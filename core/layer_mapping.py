@@ -396,6 +396,7 @@ def build_layer_model_signature(
     domain_bounds,
     mask_parameters: dict[str, object],
     control_state: dict[str, object] | None = None,
+    crs: dict[str, object] | None = None,
 ) -> dict[str, object]:
     selected_layers = [] if reservoir_layer is None else [str(reservoir_layer)]
     variogram = {
@@ -419,6 +420,7 @@ def build_layer_model_signature(
         interpolation_parameters={
             "method": interpolation_parameters,
             "grid": grid_parameters or {},
+            "crs_epsg": normalize_crs_config(crs).get("epsg"),
         },
         layer_mapping_scope=normalize_layer_scope(layer_mapping_scope),
         interpolation_domain=interpolation_domain,
@@ -616,6 +618,7 @@ def generate_single_layer_map(
         domain_bounds=domain_bounds,
         mask_parameters=mask_parameters,
         control_state=control_selection.signature_state,
+        crs=crs,
     )
 
     reservoir_geometry = polygon_union(reservoir_boundary_layer.polygon_features) if reservoir_boundary_layer else None

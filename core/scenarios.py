@@ -13,7 +13,7 @@ from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
 from core.active_data import panel_mode_from_legacy
-from core.crs import normalize_crs_config
+from core.crs import normalize_crs_config, map_crs_snapshot
 from core.engineering_controls import (
     deserialize_control_points,
     deserialize_control_regions,
@@ -102,7 +102,12 @@ def create_map_scenario(
         generated_map.get("panel_interpolation_mode"),
         bool(generated_map.get("respect_compartments", False)),
     )
+    crs_snapshot = map_crs_snapshot(generated_map)
     scenario = {
+        "CRS_Mode": crs_snapshot["mode"],
+        "EPSG": crs_snapshot["epsg"],
+        "CRS_Name": crs_snapshot["name"],
+        "Coordinate_Unit": generated_map.get("coordinate_unit", ""),
         "scenario_schema_version": "1.0",
         "id": scenario_id or uuid4().hex,
         "name": name.strip() or str(generated_map.get("title") or "Saved Map"),
@@ -141,7 +146,7 @@ def create_map_scenario(
         "include_state": json_safe((project_context or {}).get("include_state", {})),
         "included_observation_ids": _observation_ids(included_observations),
         "excluded_observation_ids": _observation_ids(excluded_observations),
-        "crs": json_safe(normalize_crs_config(generated_map.get("crs") or (project_context or {}).get("crs", {}))),
+        "crs": json_safe(crs_snapshot),
         "export_metadata": json_safe(generated_map.get("export_metadata", {})),
         "measured_observation_count": int(generated_map.get("measured_observation_count", len(included_observations))),
         "conditioning_observation_count": int(

@@ -29,6 +29,8 @@ def control_region_drawer(
     x_label: str = "X",
     y_label: str = "Y",
     height: int = 620,
+    mode: str = "polygon",
+    preview_point: dict[str, float] | None = None,
     key: str | None = None,
 ) -> dict[str, Any] | None:
     """Render the drawer and return the latest drawing event."""
@@ -46,6 +48,8 @@ def control_region_drawer(
         x_label=x_label,
         y_label=y_label,
         height=int(height),
+        mode=mode,
+        preview_point=preview_point,
         default=None,
         key=key,
     )
