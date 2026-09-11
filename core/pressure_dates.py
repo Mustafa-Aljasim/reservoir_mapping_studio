@@ -67,11 +67,11 @@ def format_map_date(value: date | pd.Timestamp | str | None) -> str:
     return parsed.strftime("%d-%b-%Y")
 
 
-def measurement_age_days(measurement_value, map_reference_date: date | None) -> int | None:
+def measurement_age_days(measurement_value, map_reference_date: date | pd.Timestamp | str | None) -> int | None:
     if map_reference_date is None or pd.isna(measurement_value):
         return None
-    parsed = pd.to_datetime(measurement_value, errors="coerce")
-    if pd.isna(parsed):
+    parsed_measurement = pd.to_datetime(measurement_value, errors="coerce")
+    parsed_reference = pd.to_datetime(map_reference_date, errors="coerce")
+    if pd.isna(parsed_measurement) or pd.isna(parsed_reference):
         return None
-    return (map_reference_date - parsed.date()).days
-
+    return (parsed_reference.date() - parsed_measurement.date()).days

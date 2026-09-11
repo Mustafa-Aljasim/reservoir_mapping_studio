@@ -330,10 +330,8 @@ with geometry_tab:
         key="geometry_uploader",
     )
     geometry_role_to_type = {
-        "Reservoir Outer Boundary": "Reservoir Boundary",
-        "Panel / Compartment Polygons": "Panel / Compartment",
-        "Fault Lines": "Fault",
-        "Reference / Custom Geometry": "Custom",
+        "Reservoir Boundary": "Reservoir Boundary",
+        "Custom Geometry": "Custom",
     }
     geometry_role = st.selectbox(
         "Geometry Role",
@@ -356,7 +354,7 @@ with geometry_tab:
                 suggested = suggest_geometry_name_attribute(property_names)
                 options = ["None"] + property_names
                 default_index = options.index(suggested) if suggested in options else 0
-                attr_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Name / ID Attribute"
+                attr_label = "Name / ID Attribute"
                 selected_name_attr = st.selectbox(attr_label, options, index=default_index)
                 name_attribute = None if selected_name_attr == "None" else selected_name_attr
             elif extension == "csv":
@@ -368,7 +366,7 @@ with geometry_tab:
                 geom_y_col = st.selectbox("Geometry Y Column", csv_columns, index=csv_columns.index(y_guess))
                 group_options = ["None"] + csv_columns
                 default_group = "Panel" if "Panel" in csv_columns else ("Polygon_ID" if "Polygon_ID" in csv_columns else "None")
-                group_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Polygon / Line ID Column"
+                group_label = "Polygon / Line ID Column"
                 group_col = st.selectbox(group_label, group_options, index=group_options.index(default_group))
                 name_attribute = None if group_col == "None" else group_col
             elif extension == "zip":
@@ -384,7 +382,7 @@ with geometry_tab:
                 zip_field_options = ["None"] + zip_fields
                 suggested_field = suggest_geometry_name_attribute(zip_fields)
                 default_field_index = zip_field_options.index(suggested_field) if suggested_field in zip_field_options else 0
-                attr_label = "Panel Name Attribute" if layer_type == "Panel / Compartment" else "Name / ID Attribute"
+                attr_label = "Name / ID Attribute"
                 selected_field = st.selectbox(
                     attr_label,
                     zip_field_options,
@@ -392,7 +390,7 @@ with geometry_tab:
                     key="zip_name_attribute",
                 )
                 name_attribute = None if selected_field == "None" else selected_field
-                if layer_type in {"Reservoir Boundary", "Panel / Compartment"}:
+                if layer_type == "Reservoir Boundary":
                     detected_linework = read_zipped_shapefile_geometry_types(raw_bytes, shapefile_choice)
                     if detected_linework["has_line_geometry"]:
                         st.info("Boundary line geometry detected.")
@@ -414,7 +412,7 @@ with geometry_tab:
                         layer_name,
                         name_attribute,
                         uploaded_geometry.name,
-                        convert_closed_linework=convert_closed_linework if layer_type in {"Reservoir Boundary", "Panel / Compartment"} else False,
+                        convert_closed_linework=convert_closed_linework if layer_type == "Reservoir Boundary" else False,
                     )
                 elif extension == "csv" and csv_df is not None:
                     layer = load_geometry_csv(csv_df, layer_type, layer_name, geom_x_col, geom_y_col, name_attribute, uploaded_geometry.name)
@@ -440,10 +438,6 @@ with geometry_tab:
                 validated_layer, report = validate_geometry_layer(layer, extent)
                 if layer_type == "Reservoir Boundary":
                     geometry_layers["reservoir_boundary"] = validated_layer
-                elif layer_type == "Panel / Compartment":
-                    geometry_layers["panels"] = validated_layer
-                elif layer_type == "Fault":
-                    geometry_layers["faults"] = validated_layer
                 else:
                     geometry_layers.setdefault("custom", []).append(validated_layer)
                 st.session_state.geometry_layers = geometry_layers

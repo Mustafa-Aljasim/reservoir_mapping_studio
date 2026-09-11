@@ -11,7 +11,7 @@ from shapely.geometry.base import BaseGeometry
 
 from components.control_region_drawer import control_region_drawer
 from core.control_import import FIELDS, read_control_file, suggest_control_columns, preview_control_import, apply_pending_pick
-from core.active_data import prepare_active_property_data
+from core.active_data import PANEL_MODE_COMBINED, prepare_active_property_data
 from core.column_mapper import normalize_column_mappings, numeric_property_candidates
 from core.data_qc import build_qc_summary, descriptive_statistics, flag_outliers
 from core.engineering_controls import (
@@ -73,12 +73,20 @@ from core.masking import auto_maximum_distance
 from core.pressure_dates import format_map_date, summarize_measurement_dates
 from core.plotting.geometry_layers import add_fault_layer, add_polygon_layer
 from core.plotting.engineering_controls import add_control_region_overlays, add_engineering_control_traces
-from core.plotting.map_builder import build_context_map_figure, build_map_figure, move_observation_traces_to_top
+from core.plotting.map_builder import (
+    build_context_map_figure,
+    build_map_figure,
+    map_figure_for_static_export,
+    move_observation_traces_to_top,
+)
 from core.plotting.styling import format_numeric
 from core.scenarios import (
     create_map_scenario,
     duplicate_scenario,
     rename_scenario,
+    safe_scenario_to_generated_map,
+    scenario_by_id,
+    scenario_display_label,
     scenario_summary_table,
     scenario_to_generated_map,
 )
@@ -103,6 +111,7 @@ from utils.constants import (
     GRID_PRESETS,
     INCLUDE_COLUMN,
     INTERNAL_ROW_ID,
+    INTERPOLATION_METHOD_FAMILIES,
     INTERPOLATION_METHODS,
     MASK_OPTIONS,
     OUTLIER_COLUMN,
@@ -179,7 +188,68 @@ def convert_observations_for_display(
     return converted
 
 
-def render_static_image_export_controls(figure, base_name: str) -> None:
+def export_visibility_defaults(
+    layer_settings: dict[str, object] | None,
+    style_settings: dict[str, object] | None,
+) -> dict[str, bool]:
+    layer_settings = layer_settings or {}
+    style_settings = style_settings or {}
+    return {
+        "include_raw_points": bool(style_settings.get("show_wells", True))
+        and bool(layer_settings.get("show_raw_points", layer_settings.get("show_wells", True))),
+        "include_excluded": bool(style_settings.get("show_excluded", True))
+        and bool(layer_settings.get("show_excluded", True)),
+        "include_controls": bool(layer_settings.get("show_engineering_controls", True)),
+        "include_regions": bool(layer_settings.get("show_control_regions", True)),
+    }
+
+
+def render_export_visibility_controls(defaults: dict[str, bool]) -> dict[str, bool]:
+    st.markdown("##### Map Image Content")
+    checkbox_defaults = {
+        "export_include_raw_points": bool(defaults.get("include_raw_points", True)),
+        "export_include_excluded_observations": bool(defaults.get("include_excluded", True)),
+        "export_include_engineering_controls": bool(defaults.get("include_controls", True)),
+        "export_include_control_regions": bool(defaults.get("include_regions", True)),
+    }
+    defaults_signature = tuple(sorted(checkbox_defaults.items()))
+    if st.session_state.get("export_visibility_defaults_signature") != defaults_signature:
+        st.session_state.export_visibility_defaults_signature = defaults_signature
+        for key, value in checkbox_defaults.items():
+            st.session_state[key] = value
+    content_cols = st.columns(4)
+    return {
+        "include_raw_points": content_cols[0].checkbox(
+            "Raw Measured Points",
+            value=checkbox_defaults["export_include_raw_points"],
+            key="export_include_raw_points",
+        ),
+        "include_excluded": content_cols[1].checkbox(
+            "Excluded Observations",
+            value=checkbox_defaults["export_include_excluded_observations"],
+            key="export_include_excluded_observations",
+        ),
+        "include_controls": content_cols[2].checkbox(
+            "Engineering Control Points",
+            value=checkbox_defaults["export_include_engineering_controls"],
+            key="export_include_engineering_controls",
+        ),
+        "include_regions": content_cols[3].checkbox(
+            "Control Regions",
+            value=checkbox_defaults["export_include_control_regions"],
+            key="export_include_control_regions",
+        ),
+    }
+
+
+def render_static_image_export_controls(
+    figure,
+    base_name: str,
+    *,
+    layer_settings: dict[str, object] | None = None,
+    style_settings: dict[str, object] | None = None,
+    visibility_options: dict[str, bool] | None = None,
+) -> None:
     export_cols = st.columns(4)
     with export_cols[0]:
         width = st.number_input("Image Width", min_value=600, max_value=6000, value=1800, step=100)
@@ -189,8 +259,34 @@ def render_static_image_export_controls(figure, base_name: str) -> None:
         scale = st.number_input("Image Scale", min_value=1.0, max_value=5.0, value=2.0, step=0.5)
     with export_cols[3]:
         show_legend = st.checkbox("Legend", value=True)
+    if visibility_options is None:
+        visibility_options = render_export_visibility_controls(
+            export_visibility_defaults(layer_settings, style_settings)
+        )
+    include_raw_points = bool(visibility_options.get("include_raw_points", True))
+    include_excluded = bool(visibility_options.get("include_excluded", True))
+    include_controls = bool(visibility_options.get("include_controls", True))
+    include_regions = bool(visibility_options.get("include_regions", True))
     export_title = st.text_input("Export Title", value=str(figure.layout.title.text or base_name))
-    export_figure = go.Figure(figure.to_plotly_json())
+    export_options = {
+        "width": int(width),
+        "height": int(height),
+        "scale": float(scale),
+        "show_legend": bool(show_legend),
+        "title": export_title,
+        "include_raw_points": bool(include_raw_points),
+        "include_excluded": bool(include_excluded),
+        "include_controls": bool(include_controls),
+        "include_regions": bool(include_regions),
+        "base_name": base_name,
+    }
+    export_figure = map_figure_for_static_export(
+        figure,
+        include_raw_points=include_raw_points,
+        include_excluded_observations=include_excluded,
+        include_engineering_controls=include_controls,
+        include_control_regions=include_regions,
+    )
     export_figure.update_layout(title=export_title, showlegend=show_legend)
     if st.button("PREPARE MAP IMAGE EXPORTS"):
         try:
@@ -199,16 +295,19 @@ def render_static_image_export_controls(figure, base_name: str) -> None:
                 "svg": figure_to_image_bytes(export_figure, "svg", int(width), int(height), float(scale)),
                 "pdf": figure_to_image_bytes(export_figure, "pdf", int(width), int(height), float(scale)),
                 "base_name": base_name,
+                "options": export_options,
             }
             st.success("Image exports prepared.")
         except RuntimeError as exc:
             st.error(str(exc))
     exports = st.session_state.get("map_image_exports", {})
-    if exports:
+    if exports and exports.get("options") == export_options:
         button_cols = st.columns(3)
         button_cols[0].download_button("Download PNG", exports["png"], f"{exports['base_name']}.png", "image/png")
         button_cols[1].download_button("Download SVG", exports["svg"], f"{exports['base_name']}.svg", "image/svg+xml")
         button_cols[2].download_button("Download PDF", exports["pdf"], f"{exports['base_name']}.pdf", "application/pdf")
+    elif exports:
+        st.caption("Export options changed. Prepare map image exports again to refresh the downloads.")
 
 
 def render_static_image_exports(figure, base_name: str) -> None:
@@ -282,7 +381,54 @@ def method_parameter_controls(
                 st.caption(f"Auto RBF epsilon estimate: {format_distance(epsilon, coordinate_unit)}")
         return {"kernel": kernel, "smoothing": smoothing, "neighbors": neighbors, "epsilon": epsilon}
 
-    if method == "Ordinary Kriging":
+    if method == "Natural Neighbor":
+        st.caption(
+            "Natural Neighbor uses bounded Voronoi-cell area weights and does not extrapolate outside the conditioning-point support."
+        )
+        return {}
+
+    if method == "Minimum Curvature":
+        smoothing = st.number_input("Smoothing", min_value=0.0, value=0.0, step=0.1)
+        st.caption("Implemented as a thin-plate spline biharmonic minimum-bending-energy surface.")
+        return {"smoothing": smoothing}
+
+    if method == "Convergent Interpolation":
+        st.caption("Iterative convergent surface interpolation implemented by Reservoir Mapping Studio.")
+        cols = st.columns(2)
+        with cols[0]:
+            initial_method = st.selectbox("Initial Surface Method", ["IDW", "Moving Average"], index=0)
+            max_iterations = st.number_input("Maximum Iterations", min_value=1, max_value=200, value=25, step=1)
+            neighbors = st.number_input("Neighbor Count", min_value=1, max_value=200, value=12, step=1)
+        with cols[1]:
+            convergence_tolerance = st.number_input("Convergence Tolerance", min_value=0.0, value=1.0, step=0.5)
+            relaxation = st.slider("Relaxation Factor", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
+            smoothing = st.number_input("Optional Smoothing", min_value=0.0, value=0.0, step=0.25)
+        radius_mode = st.radio("Search Radius", ["Unlimited", "Manual"], horizontal=True)
+        search_radius = None
+        if radius_mode == "Manual":
+            search_radius = st.number_input(
+                f"Search Radius ({unit_symbol})",
+                min_value=0.0001,
+                value=float(auto_idw_search_radius(prepared, grid_buffer_fraction) or 1000.0),
+                step=100.0,
+            )
+        return {
+            "initial_surface_method": initial_method,
+            "max_iterations": int(max_iterations),
+            "convergence_tolerance": convergence_tolerance,
+            "relaxation_factor": relaxation,
+            "neighbors": int(neighbors),
+            "search_radius": search_radius,
+            "smoothing": smoothing,
+        }
+
+    if method in {"Ordinary Kriging", "Universal Kriging"}:
+        show_advanced = st.checkbox("Advanced Kriging Settings", value=True)
+        trend_model = "None / Constant mean assumption"
+        if method == "Universal Kriging":
+            trend_model = st.selectbox("Trend Model", ["Linear XY", "Quadratic XY"], index=0)
+        else:
+            st.caption("Trend: None / Constant mean assumption.")
         values = pd.to_numeric(prepared["Z"], errors="coerce").dropna() if not prepared.empty else pd.Series(dtype=float)
         x_values = pd.to_numeric(prepared["X"], errors="coerce").dropna() if not prepared.empty else pd.Series(dtype=float)
         y_values = pd.to_numeric(prepared["Y"], errors="coerce").dropna() if not prepared.empty else pd.Series(dtype=float)
@@ -291,7 +437,7 @@ def method_parameter_controls(
         default_range = max(float(np.hypot(x_span, y_span)) / 3.0, 1.0)
         default_variance = max(float(values.var(ddof=1)) if len(values) > 1 else 1.0, 1e-6)
 
-        variogram_mode = st.radio("Variogram Parameters", ["Auto Fit", "Manual"], horizontal=True)
+        variogram_mode = st.radio("Variogram Parameters", ["Auto Fit", "Manual"], horizontal=True) if show_advanced else "Auto Fit"
         best_fit = None
         fit_error = None
         if variogram_mode == "Auto Fit" and len(prepared) >= 5 and values.nunique() > 1:
@@ -309,65 +455,74 @@ def method_parameter_controls(
             except ValueError as exc:
                 st.warning(str(exc))
 
-        cols = st.columns(3)
-        with cols[0]:
-            model = st.selectbox(
-                "Model",
-                ["Spherical", "Exponential", "Gaussian"],
-                index=["Spherical", "Exponential", "Gaussian"].index(best_fit.model) if best_fit else 0,
-            )
-        with cols[1]:
-            range_value = st.number_input(
-                f"Range ({unit_symbol})",
-                min_value=0.0001,
-                value=float(best_fit.range_value if best_fit else default_range),
-                step=max(default_range / 20.0, 1.0),
-            )
-        with cols[2]:
-            variance = st.number_input(
-                "Variance / Partial Sill",
-                min_value=0.000001,
-                value=float(best_fit.variance if best_fit else default_variance),
-            )
-        nugget = st.number_input("Nugget", min_value=0.0, value=float(best_fit.nugget if best_fit else 0.0))
-
-        anis_cols = st.columns(3)
-        with anis_cols[0]:
-            anisotropy_enabled = st.checkbox("Enable Anisotropy", value=False)
-        with anis_cols[1]:
-            anisotropy_angle = st.number_input(
-                "Major Continuity Direction (degrees)",
-                min_value=0.0,
-                max_value=180.0,
-                value=0.0,
-                help="0 degrees = +X direction, 90 degrees = +Y direction, counterclockwise positive.",
-            )
-        with anis_cols[2]:
-            anisotropy_ratio = st.number_input(
-                "Anisotropy Ratio",
-                min_value=0.01,
-                max_value=1.0,
-                value=1.0,
-                step=0.05,
-                help="Minor range divided by major range.",
-            )
-
-        neigh_cols = st.columns(3)
-        with neigh_cols[0]:
-            neighborhood = st.radio("Kriging Neighborhood", ["All Observations", "Local"], horizontal=True)
+        model = best_fit.model if best_fit else "Spherical"
+        range_value = float(best_fit.range_value if best_fit else default_range)
+        variance = float(best_fit.variance if best_fit else default_variance)
+        nugget = float(best_fit.nugget if best_fit else 0.0)
+        anisotropy_enabled = False
+        anisotropy_angle = 0.0
+        anisotropy_ratio = 1.0
         max_neighbors = None
         search_radius = None
-        if neighborhood == "Local":
-            with neigh_cols[1]:
-                max_neighbors = st.number_input("Maximum Neighbors", min_value=3, max_value=500, value=30, step=1)
-            with neigh_cols[2]:
-                search_radius = st.number_input(
-                    f"Search Radius ({unit_symbol})",
-                    min_value=0.0001,
-                    value=float(auto_idw_search_radius(prepared, grid_buffer_fraction)),
-                    step=100.0,
+        if show_advanced:
+            cols = st.columns(3)
+            with cols[0]:
+                model = st.selectbox(
+                    "Variogram Model",
+                    ["Spherical", "Exponential", "Gaussian"],
+                    index=["Spherical", "Exponential", "Gaussian"].index(best_fit.model) if best_fit else 0,
                 )
+            with cols[1]:
+                range_value = st.number_input(
+                    f"Range ({unit_symbol})",
+                    min_value=0.0001,
+                    value=float(best_fit.range_value if best_fit else default_range),
+                    step=max(default_range / 20.0, 1.0),
+                )
+            with cols[2]:
+                variance = st.number_input(
+                    "Sill / Variance",
+                    min_value=0.000001,
+                    value=float(best_fit.variance if best_fit else default_variance),
+                )
+            nugget = st.number_input("Nugget", min_value=0.0, value=float(best_fit.nugget if best_fit else 0.0))
+
+            anis_cols = st.columns(3)
+            with anis_cols[0]:
+                anisotropy_enabled = st.checkbox("Enable Anisotropy", value=False)
+            with anis_cols[1]:
+                anisotropy_angle = st.number_input(
+                    "Major Continuity Direction (degrees)",
+                    min_value=0.0,
+                    max_value=180.0,
+                    value=0.0,
+                    help="0 degrees = +X direction, 90 degrees = +Y direction, counterclockwise positive.",
+                )
+            with anis_cols[2]:
+                anisotropy_ratio = st.number_input(
+                    "Anisotropy Ratio",
+                    min_value=0.01,
+                    max_value=1.0,
+                    value=1.0,
+                    step=0.05,
+                    help="Minor range divided by major range.",
+                )
+
+            neigh_cols = st.columns(3)
+            with neigh_cols[0]:
+                neighborhood = st.radio("Kriging Neighborhood", ["All Observations", "Local"], horizontal=True)
+            if neighborhood == "Local":
+                with neigh_cols[1]:
+                    max_neighbors = st.number_input("Maximum Neighbors", min_value=3, max_value=500, value=30, step=1)
+                with neigh_cols[2]:
+                    search_radius = st.number_input(
+                        f"Search Radius ({unit_symbol})",
+                        min_value=0.0001,
+                        value=float(auto_idw_search_radius(prepared, grid_buffer_fraction)),
+                        step=100.0,
+                    )
         return {
+            "trend_model": trend_model,
             "variogram_model": model,
             "variogram_mode": variogram_mode,
             "variogram_range_convention": VARIOGRAM_RANGE_CONVENTION,
@@ -888,6 +1043,34 @@ def current_open_scenario() -> dict[str, object] | None:
     return None
 
 
+CURRENT_WORKSPACE_DISPLAY_ID = "__current_workspace__"
+
+
+def scenario_display_options(scenarios: list[dict[str, object]]) -> dict[str, str]:
+    options = {CURRENT_WORKSPACE_DISPLAY_ID: "Current Workspace"}
+    seen_labels = set(options.values())
+    for scenario in scenarios or []:
+        scenario_id = str(scenario.get("id") or "")
+        if not scenario_id:
+            continue
+        label = scenario_display_label(scenario)
+        if label in seen_labels:
+            label = f"{label} ({scenario_id[:8]})"
+        seen_labels.add(label)
+        options[scenario_id] = label
+    return options
+
+
+def load_generated_map_into_workspace(generated_map: dict[str, object], scenario_id: str | None = None) -> None:
+    opened = {**generated_map}
+    opened_layer = layer_map_key(opened)
+    st.session_state.generated_layer_maps = {opened_layer: opened}
+    st.session_state.active_generated_layer = opened_layer
+    st.session_state.generated_map = opened
+    st.session_state.current_scenario_id = scenario_id
+    st.session_state.pending_displayed_map_id = CURRENT_WORKSPACE_DISPLAY_ID
+
+
 def render_status(status: str) -> None:
     if status == MAP_STATUS_UP_TO_DATE:
         st.success(f"Map Status: {status}")
@@ -938,7 +1121,11 @@ def render_style_controls(filtered_with_include: pd.DataFrame, property_col: str
         style["show_wells"] = st.checkbox("Show Wells", value=bool(style.get("show_wells", True)))
         style["marker_outline"] = st.checkbox("Marker Outline", value=bool(style.get("marker_outline", True)))
     with cols[1]:
-        style["show_contour_labels"] = st.checkbox("Show Contour Labels", value=bool(style.get("show_contour_labels", False)))
+        style["show_contour_labels"] = st.checkbox(
+            "Show Contour Labels",
+            value=bool(style.get("show_contour_labels", False)) and bool(style.get("show_contour_lines", True)),
+            disabled=not bool(style.get("show_contour_lines", True)),
+        )
         style["show_excluded"] = st.checkbox("Show Excluded Observations", value=bool(style.get("show_excluded", True)))
 
     style["contour_line_width"] = st.slider(
@@ -1052,9 +1239,16 @@ y_col = mappings.get("y")
 well_col = mappings.get("well")
 geometry_layers = st.session_state.geometry_layers
 reservoir_boundary_layer = geometry_layers.get("reservoir_boundary")
-panel_layer = geometry_layers.get("panels")
+legacy_panel_layer = geometry_layers.get("panels")
 fault_layer = geometry_layers.get("faults")
 custom_layers = geometry_layers.get("custom", [])
+panel_geometry_choices = {}
+if legacy_panel_layer is not None and legacy_panel_layer.polygon_features:
+    panel_geometry_choices["legacy_panels"] = legacy_panel_layer
+for custom_index, custom_layer in enumerate(custom_layers):
+    if custom_layer.polygon_features:
+        panel_geometry_choices[f"custom_{custom_index}"] = custom_layer
+panel_layer = legacy_panel_layer
 if not x_col or not y_col:
     st.warning("Map X and Y coordinate columns in the Data Manager before generating a reservoir map.")
     st.stop()
@@ -1125,9 +1319,44 @@ with controls_col:
             ("layer",),
         )
 
+        panel_choice_labels = {
+            "None": "None",
+            **{key: layer.name for key, layer in panel_geometry_choices.items()},
+        }
+        panel_geometry_key = "None"
+        if panel_geometry_choices:
+            default_key = "legacy_panels" if "legacy_panels" in panel_geometry_choices else next(iter(panel_geometry_choices))
+            current_key = st.session_state.get("mapping_panel_boundary_geometry", default_key)
+            if current_key not in panel_choice_labels:
+                current_key = default_key
+            panel_geometry_key = st.selectbox(
+                "Panel Boundary Geometry",
+                list(panel_choice_labels),
+                index=list(panel_choice_labels).index(current_key),
+                format_func=lambda value: panel_choice_labels[value],
+                key="mapping_panel_boundary_geometry",
+                help="Optional polygon geometry for selected-panel domain/mask and required for independent compartment interpolation.",
+            )
+        panel_layer = panel_geometry_choices.get(panel_geometry_key)
+        panel_col = mappings.get("panel")
         if panel_layer is not None and panel_layer.polygon_features:
             selected_panels = panel_selection_control(panel_layer, "mapping_selected_panels")
             panel_interpolation_mode = panel_interpolation_mode_control(True, "mapping_panel_interpolation_mode")
+        elif panel_col and panel_col in filtered_base.columns:
+            panel_options = data_panel_options(filtered_base, panel_col)
+            current_panels = [value for value in st.session_state.get("mapping_selected_panels", []) if value in panel_options]
+            if not current_panels and "mapping_selected_panels" not in st.session_state:
+                current_panels = panel_options
+            selected_panels = st.multiselect(
+                "Panel Selection",
+                panel_options,
+                default=current_panels,
+                key="mapping_selected_panels",
+                help="Combined selected panels can use the dataframe Panel field without polygon geometry.",
+            )
+            st.session_state.selected_panels = selected_panels
+            panel_interpolation_mode = PANEL_MODE_COMBINED
+            st.caption("Independent panel interpolation requires compatible polygon boundary geometry.")
         else:
             selected_panels = []
             panel_interpolation_mode = panel_interpolation_mode_control(False, "mapping_panel_interpolation_mode")
@@ -1145,7 +1374,7 @@ with controls_col:
 
         active_for_layers = pd.DataFrame()
         try:
-            panel_selection_for_layers = selected_panels if panel_layer is not None and mappings.get("panel") else None
+            panel_selection_for_layers = selected_panels if mappings.get("panel") else None
             active_for_layers = prepare_active_property_data(
                 df,
                 mappings,
@@ -1854,7 +2083,26 @@ with controls_col:
         filtered_with_include, prepared = prepare_observations_for_layer(preview_layer)
         filtered_with_include = flag_outliers(filtered_with_include, property_col)
         grid_parameters = grid_controls()
-        method = st.radio("Interpolation Method", INTERPOLATION_METHODS, horizontal=True, index=0)
+        family_names = list(INTERPOLATION_METHOD_FAMILIES)
+        current_family = st.session_state.get("mapping_interpolation_family", family_names[0])
+        if current_family not in family_names:
+            current_family = family_names[0]
+        interpolation_family = st.selectbox(
+            "Interpolation Family",
+            family_names,
+            index=family_names.index(current_family),
+            key="mapping_interpolation_family",
+        )
+        family_methods = list(INTERPOLATION_METHOD_FAMILIES[interpolation_family])
+        current_method = st.session_state.get("mapping_interpolation_method", family_methods[0])
+        if current_method not in family_methods:
+            current_method = family_methods[0]
+        method = st.selectbox(
+            "Method",
+            family_methods,
+            index=family_methods.index(current_method),
+            key="mapping_interpolation_method",
+        )
         if panel_layer is not None and panel_layer.polygon_features:
             if panel_interpolation_mode == "Independent by Panel / Compartment":
                 st.caption("Independent mode: each selected panel is interpolated from its own assigned observations.")
@@ -1984,6 +2232,10 @@ with controls_col:
                     st.session_state.generated_layer_batch_signature = collection.batch_signature
                     st.session_state.active_generated_layer = collection.active_layer
                     st.session_state.generated_map = select_generated_layer_map(collection.maps, collection.active_layer)
+                    for map_result in st.session_state.generated_layer_maps.values():
+                        map_result["interpolation_family"] = interpolation_family
+                    if st.session_state.generated_map is not None:
+                        st.session_state.generated_map["interpolation_family"] = interpolation_family
                     mark_project_dirty()
                     if collection.maps:
                         st.success(f"Generated {len(collection.maps):,} layer map(s).")
@@ -2140,11 +2392,64 @@ context_bounds = draw_payload_bounds(
 current_plot_figure = None
 
 with map_col:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="column"]:has(.rms-map-pane-anchor) {
+            position: sticky;
+            top: 4.25rem;
+            align-self: flex-start;
+            z-index: 2;
+        }
+        .rms-map-pane-anchor {
+            display: block;
+            height: 0;
+            overflow: hidden;
+        }
+        </style>
+        <span class="rms-map-pane-anchor"></span>
+        """,
+        unsafe_allow_html=True,
+    )
     generated_layer_maps = dict(st.session_state.get("generated_layer_maps", {}) or {})
-    generated = st.session_state.get("generated_map")
+    workspace_generated = st.session_state.get("generated_map")
+    saved_scenarios_for_display = list(st.session_state.get("map_scenarios", []) or [])
+    display_options = scenario_display_options(saved_scenarios_for_display)
+    pending_display_id = st.session_state.pop("pending_displayed_map_id", None)
+    if pending_display_id in display_options:
+        st.session_state.displayed_map_id = pending_display_id
+    current_display_id = str(st.session_state.get("displayed_map_id") or CURRENT_WORKSPACE_DISPLAY_ID)
+    if current_display_id not in display_options:
+        current_display_id = CURRENT_WORKSPACE_DISPLAY_ID
+        st.session_state.displayed_map_id = current_display_id
+    selected_display_id = st.selectbox(
+        "Displayed Map",
+        list(display_options),
+        index=list(display_options).index(current_display_id),
+        format_func=lambda value: display_options[value],
+        key="displayed_map_id",
+    )
+    display_scenario = scenario_by_id(saved_scenarios_for_display, selected_display_id)
+    display_scenario_errors: list[str] = []
+    generated = workspace_generated
+    displayed_scenario_id = None
+    if display_scenario is not None:
+        generated, display_scenario_errors = safe_scenario_to_generated_map(display_scenario)
+        displayed_scenario_id = str(display_scenario.get("id") or "")
+        if generated is None:
+            generated = workspace_generated
+    if display_scenario is not None and generated is not None:
+        if st.button("Load Scenario Into Workspace", width="stretch"):
+            load_generated_map_into_workspace(generated, displayed_scenario_id)
+            st.success("Scenario loaded into the workspace.")
+            st.rerun()
+    if display_scenario_errors:
+        st.warning("Saved scenario cannot be displayed: " + "; ".join(display_scenario_errors))
+    st.session_state.displayed_map_result = generated
+    st.session_state.displayed_scenario_id = displayed_scenario_id
     if generated and not crs_are_compatible(generated.get("crs"), st.session_state.get("crs")):
         st.info(f"This map uses {crs_display_name(generated.get('crs'))}; export will preserve the map/scenario CRS. Update the map to use the current Project CRS. No reprojection occurs.")
-    if generated_layer_maps:
+    if selected_display_id == CURRENT_WORKSPACE_DISPLAY_ID and generated_layer_maps:
         layer_keys = list(generated_layer_maps)
         current_layer_key = st.session_state.get("active_generated_layer")
         if current_layer_key not in layer_keys:
@@ -2158,6 +2463,7 @@ with map_col:
         st.session_state.active_generated_layer = selected_generated_layer
         generated = generated_layer_maps[selected_generated_layer]
         st.session_state.generated_map = generated
+        st.session_state.displayed_map_result = generated
 
     if st.session_state.get("control_point_picking_active"):
         st.subheader("Pick Control Location")
@@ -2274,21 +2580,36 @@ with map_col:
             st.metric("Pressure Map Reference Date", format_map_date(pressure_reference_date))
         st.caption("Property Surface and Contours become available after Generate Map.")
     else:
-        display_status = map_status(current_signature_for_display(generated), generated)
+        display_status = (
+            "Saved scenario snapshot"
+            if st.session_state.get("displayed_scenario_id")
+            else map_status(current_signature_for_display(generated), generated)
+        )
         measured_count = int(generated.get("measured_observation_count") or len(generated.get("included_observations", [])))
         engineering_control_count = int(generated.get("engineering_control_count") or 0)
         control_region_count = int(generated.get("control_region_count") or 0)
         status_cols = st.columns([1.2, 1, 1, 1, 1, 1])
         with status_cols[0]:
-            render_status(display_status)
+            if display_status == "Saved scenario snapshot":
+                st.info(display_status)
+            else:
+                render_status(display_status)
         status_cols[1].metric("Layer Scope", generated.get("layer_mapping_scope") or LAYER_SCOPE_SELECTED)
         status_cols[2].metric("Reservoir Layer", generated.get("reservoir_layer") or UNSPECIFIED_LAYER)
         status_cols[3].metric("Measured", f"{measured_count:,}")
         status_cols[4].metric("Controls", f"{engineering_control_count:,}")
         status_cols[5].metric("Regions", f"{control_region_count:,}")
 
-        style = st.session_state.get("style_settings", {})
-        layer_settings = st.session_state.get("layer_settings", {})
+        style = (
+            generated.get("display_style_settings", {})
+            if st.session_state.get("displayed_scenario_id")
+            else st.session_state.get("style_settings", {})
+        )
+        layer_settings = (
+            generated.get("display_layer_settings", {})
+            if st.session_state.get("displayed_scenario_id")
+            else st.session_state.get("layer_settings", {})
+        )
         plot_style = plot_style_with_overlay_settings(style, layer_settings, generated_surface=True)
         debug_cols = st.columns(3)
         show_debug_boundary = debug_cols[0].checkbox("Show Reservoir Boundary", value=True, key="debug_show_boundary")
@@ -2298,20 +2619,21 @@ with map_col:
         title = style.get("title_override") or generated.get("title")
         display_coordinate_unit = st.session_state.get("coordinate_unit", generated.get("coordinate_unit"))
         source_unit = generated.get("unit")
-        display_grid = convert_grid_for_display(generated["grid_z"], source_unit, display_unit)
+        active_display_unit = source_unit if st.session_state.get("displayed_scenario_id") else display_unit
+        display_grid = convert_grid_for_display(generated["grid_z"], source_unit, active_display_unit)
         display_property = generated["property_col"]
-        surface_unit = display_unit
+        surface_unit = active_display_unit
         included_display = convert_observations_for_display(
             generated["included_observations"],
             generated["property_col"],
             source_unit,
-            display_unit,
+            active_display_unit,
         )
         excluded_display = convert_observations_for_display(
             generated["excluded_observations"],
             generated["property_col"],
             source_unit,
-            display_unit,
+            active_display_unit,
         )
         if generated.get("grid_variance") is not None:
             display_mode = st.radio(
@@ -2340,7 +2662,7 @@ with map_col:
             plot_control_selection,
             generated["property_col"],
             source_unit,
-            display_unit,
+            active_display_unit,
         )
         display_regions = list(getattr(plot_control_selection, "regions", []) or [])
         if display_controls.empty:
@@ -2355,7 +2677,7 @@ with map_col:
                     display_controls,
                     generated["property_col"],
                     source_unit,
-                    display_unit,
+                    active_display_unit,
                 )
                 if generated["property_col"] in display_controls.columns:
                     display_controls["Value"] = display_controls[generated["property_col"]]
@@ -2373,7 +2695,7 @@ with map_col:
             well_col=generated.get("well_col"),
             hover_columns=generated.get("hover_columns", []),
             title=title,
-            unit=display_unit,
+            unit=active_display_unit,
             coordinate_unit=display_coordinate_unit,
             is_pressure_map=bool(generated.get("is_pressure_map")),
             map_reference_date=generated.get("map_reference_date"),
@@ -2431,7 +2753,7 @@ with map_col:
             x_col=generated["x_col"],
             y_col=generated["y_col"],
             property_col=generated["property_col"],
-            unit=display_unit,
+            unit=active_display_unit,
             show_manual=bool(layer_settings.get("show_engineering_controls", True)),
             show_region_points=bool(layer_settings.get("show_region_control_points", False)),
         )
@@ -2489,6 +2811,16 @@ with map_col:
                 f"{format_distance(method_details.get('search_radius'), display_coordinate_unit)}; "
                 f"duplicate handling: {generated['duplicate_method']}."
             )
+        if generated["method"] == "Convergent Interpolation":
+            convergence = generated.get("interpolation_metadata", {}) or {}
+            st.caption(
+                "Convergent Interpolation: "
+                f"iterations {convergence.get('iterations', 0)}, "
+                f"initial RMSE {format_numeric(convergence.get('initial_rmse'))}, "
+                f"final RMSE {format_numeric(convergence.get('final_rmse'))}, "
+                f"tolerance {format_numeric(convergence.get('tolerance'))}, "
+                f"converged {'Yes' if convergence.get('converged') else 'No'}."
+            )
         if generated["mask_info"].get("max_distance") is not None:
             st.caption(
                 "Maximum-distance mask used "
@@ -2537,19 +2869,24 @@ with controls_col:
         saved_scenarios = list(st.session_state.get("map_scenarios", []))
         if saved_scenarios:
             st.dataframe(scenario_summary_table(saved_scenarios), width="stretch", hide_index=True)
-            labels = [str(item.get("name") or item.get("id")) for item in saved_scenarios]
-            selected_label = st.selectbox("Selected Scenario", labels, key="mapping_studio_selected_scenario")
-            selected_index = labels.index(selected_label)
-            selected = saved_scenarios[selected_index]
+            scenario_options = scenario_display_options(saved_scenarios)
+            scenario_options.pop(CURRENT_WORKSPACE_DISPLAY_ID, None)
+            selected_id = st.selectbox(
+                "Selected Scenario",
+                list(scenario_options),
+                format_func=lambda value: scenario_options[value],
+                key="mapping_studio_selected_scenario",
+            )
+            selected = scenario_by_id(saved_scenarios, selected_id) or saved_scenarios[0]
+            selected_index = saved_scenarios.index(selected)
             scenario_action_cols = st.columns(5)
-            if scenario_action_cols[0].button("Open"):
-                opened = scenario_to_generated_map(selected)
-                opened_layer = layer_map_key(opened)
-                st.session_state.generated_layer_maps = {opened_layer: opened}
-                st.session_state.active_generated_layer = opened_layer
-                st.session_state.generated_map = opened
-                st.session_state.current_scenario_id = selected.get("id")
-                st.success("Scenario opened.")
+            if scenario_action_cols[0].button("Load Scenario Into Workspace"):
+                opened, errors = safe_scenario_to_generated_map(selected)
+                if errors or opened is None:
+                    st.error("Scenario cannot be loaded: " + "; ".join(errors))
+                else:
+                    load_generated_map_into_workspace(opened, str(selected.get("id") or ""))
+                    st.success("Scenario loaded into workspace.")
             rename_value = st.text_input(
                 "Rename Selected Scenario",
                 value=str(selected.get("name") or "Saved Map"),
@@ -2609,11 +2946,14 @@ with controls_col:
             width="stretch",
         )
 
-        generated = st.session_state.get("generated_map")
+        generated = st.session_state.get("displayed_map_result") or st.session_state.get("generated_map")
         if not generated:
             st.caption("Generate a map before exporting an interpolated grid, raster, ZMAP, image, or map metadata.")
         else:
-            active_scenario = current_open_scenario()
+            active_scenario = scenario_by_id(
+                list(st.session_state.get("map_scenarios", []) or []),
+                st.session_state.get("displayed_scenario_id"),
+            ) or current_open_scenario()
             base_name = map_base_filename(generated, project_metadata=project_metadata)
             export_metadata = build_map_export_metadata(
                 generated,
@@ -2629,7 +2969,7 @@ with controls_col:
             metadata_summary = [
                 f"Property: {export_metadata.get('Property')}",
                 f"Stored / Original Unit: {export_metadata.get('Property_Unit') or 'unitless'}",
-                f"Display Unit: {display_unit or 'unitless'}",
+                f"Display Unit: {(generated.get('unit') if st.session_state.get('displayed_scenario_id') else display_unit) or 'unitless'}",
                 f"Export Unit: original",
                 f"CRS: {crs_display_name(generated.get('crs') or {'mode': export_metadata.get('CRS_Mode'), 'epsg': export_metadata.get('CRS_EPSG')})}",
             ]
@@ -2773,13 +3113,42 @@ with controls_col:
                         width="stretch",
                     )
 
+            image_export_layer_settings = (
+                generated.get("display_layer_settings", {})
+                if st.session_state.get("displayed_scenario_id")
+                else st.session_state.get("layer_settings", {})
+            )
+            image_export_style_settings = (
+                generated.get("display_style_settings", {})
+                if st.session_state.get("displayed_scenario_id")
+                else st.session_state.get("style_settings", {})
+            )
+            image_visibility_options = (
+                render_export_visibility_controls(
+                    export_visibility_defaults(image_export_layer_settings, image_export_style_settings)
+                )
+                if current_plot_figure is not None
+                else export_visibility_defaults(image_export_layer_settings, image_export_style_settings)
+            )
+            package_figure = (
+                map_figure_for_static_export(
+                    current_plot_figure,
+                    include_raw_points=bool(image_visibility_options.get("include_raw_points", True)),
+                    include_excluded_observations=bool(image_visibility_options.get("include_excluded", True)),
+                    include_engineering_controls=bool(image_visibility_options.get("include_controls", True)),
+                    include_control_regions=bool(image_visibility_options.get("include_regions", True)),
+                )
+                if current_plot_figure is not None
+                else None
+            )
+
             st.markdown("##### Package")
             st.download_button(
                 "Map Package ZIP",
                 map_package_zip_bytes(
                     grid_export,
                     export_metadata,
-                    figure=current_plot_figure,
+                    figure=package_figure,
                     validation_df=validation_export,
                     engineering_controls=controls_export,
                     control_regions=regions_export,
@@ -2819,6 +3188,12 @@ with controls_col:
 
             st.markdown("##### Image")
             if current_plot_figure is not None:
-                render_static_image_export_controls(current_plot_figure, base_name)
+                render_static_image_export_controls(
+                    current_plot_figure,
+                    base_name,
+                    layer_settings=image_export_layer_settings,
+                    style_settings=image_export_style_settings,
+                    visibility_options=image_visibility_options,
+                )
             else:
                 st.caption("Image export is available after the map figure has rendered.")

@@ -1,6 +1,6 @@
 # Reservoir Mapping Studio
 
-Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic interpolation, engineering control points, soft control regions, panel-aware masking, Reservoir Layer selection, all-layer map batches, Ordinary Kriging, geometry layers, project persistence, saved map scenarios, side-by-side map comparison, delta maps, and pressure-change workflows while keeping the app focused on engineering use rather than geoscience research tooling.
+Reservoir Mapping Studio is a production-oriented Streamlit application for building and comparing 2D reservoir property maps from well observations. It supports deterministic, surface, and geostatistical interpolation methods; engineering control points; soft control regions; panel-aware masking; Reservoir Layer selection; all-layer map batches; Ordinary and Universal Kriging; geometry layers; project persistence; saved map scenarios; side-by-side map comparison; delta maps; and pressure-change workflows while keeping the app focused on engineering map generation.
 
 ## Installation
 
@@ -17,8 +17,7 @@ The main workspace includes:
 
 - Project: create a project, save/open `.rmsproj` archives, manage the dirty state, and maintain CRS metadata.
 - Data Manager: import CSV/Excel data, map columns, review QC, filters, and geometry.
-- Mapping Studio: generate selected-layer maps or all-layer map batches, apply masks, configure units, run interpolation, style surfaces, and save map scenarios from a persistent controls/map workspace.
-- Geostatistics Lab: fit variograms, run cross validation, inspect residuals, and compare methods for the active Reservoir Layer.
+- Mapping Studio: generate selected-layer maps or all-layer map batches, apply masks, configure units, run interpolation, configure kriging, style surfaces, switch displayed map snapshots, export maps, and save scenarios from a persistent controls/map workspace.
 - Map Comparison: select two saved maps, align grids, compare them visually, and generate delta / pressure-change surfaces.
 
 ## Core V1 Workflow
@@ -64,17 +63,19 @@ This gives a reproducible engineering workspace without relying on Python pickle
 
 ## Saved Maps and Map Library
 
-Use the Map Library to save, rename, duplicate, delete, and reopen map scenarios. Each saved map keeps the computational definition of the generated surface, including the property, reference date, grid definition, interpolation method, engineering controls used for conditioning, mask details, geometry metadata, and style settings.
+Use the Map Library to save, rename, duplicate, delete, and load map scenarios. Each saved map keeps the computational definition of the generated surface, including the property, reference date, grid definition, interpolation method, method family, method parameters, engineering controls used for conditioning, mask details, geometry metadata, CRS metadata, uncertainty grids where available, and style settings.
+
+The Mapping Studio map pane includes a `Displayed Map` selector. `Current Workspace` shows the active generated map or context map. Saved scenarios are selected by their internal scenario ID and shown with readable labels such as `Pressure | 01-Jan-2025 | Lower | Kriging`; duplicate labels are disambiguated without changing the saved ID. Selecting a saved scenario is display-only: it renders the stored grid, uncertainty grid, property/unit, layer, reference date, mask/domain metadata, and saved style without rerunning interpolation, changing filters, or mutating the scenario. Use `Load Scenario Into Workspace` only when a saved scenario should become the editable/generated workspace map.
 
 ## Reservoir Layers
 
 Reservoir Layer is an explicit vertical mapping dimension, separate from metadata filters and separate from lateral panel geometry. A source column named `Zone` can still be mapped as `Layer`, but `Zone` is not a first-class semantic field in V1.
 
-The PASS 4.1 model keeps three concepts separate:
+The V1 model keeps three concepts separate:
 
 - Reservoir Layer: vertical/correlative reservoir subdivision that controls selected-layer or all-layer map outputs.
 - Panel: lateral grouping or compartment context, usually from a mapped data `Panel` column and/or imported panel polygons.
-- Geometry Role: the spatial purpose of imported geometry, such as Reservoir Boundary, Panel / Compartment, Fault, or Reference / Custom Geometry.
+- Geometry Type: either Reservoir Boundary or Custom Geometry during new uploads.
 
 Mapping Studio supports:
 
@@ -156,10 +157,14 @@ The pressure workflow remains date-aware but does not perform temporal extrapola
 The application supports:
 
 - reservoir boundary polygon masking
-- panel/compartment masking and assignment
-- fault display and validation
-- custom geometry layers
+- legacy panel/compartment masking and assignment for existing projects
+- legacy fault display and validation for existing projects
+- custom geometry layers containing supported polygons or lines
 - maximum-distance and convex-hull mask combinations
+
+New geometry uploads are classified only as `Reservoir Boundary` or `Custom Geometry`. Reservoir Boundary remains special because it can define the interpolation domain, spatial mask, or outer map boundary and must be Polygon/MultiPolygon. Custom Geometry can store Polygon, MultiPolygon, LineString, or MultiLineString features as overlays/reference geometry while preserving source attributes. Files that older projects stored as Panel / Compartment or Fault continue to load and display.
+
+Advanced panel behavior is chosen contextually in Mapping Studio. Combined Selected Panels can operate from the dataframe `Panel` field alone. Independent by Panel / Compartment requires compatible polygon boundary geometry; a legacy panel layer or a custom polygon layer can be selected as `Panel Boundary Geometry`.
 
 Spatial Domain and Spatial Mask are separate controls:
 
@@ -172,13 +177,19 @@ Spatial Domain and Spatial Mask are separate controls:
 
 Supported methods include:
 
-- IDW
-- Linear
-- Cubic
-- RBF
-- Ordinary Kriging
+- Basic: IDW, Linear, Cubic, RBF
+- Geological / Surface: Natural Neighbor, Minimum Curvature, Convergent Interpolation
+- Geostatistical: Ordinary Kriging, Universal Kriging
 
-The geostatistics workflow includes experimental variogram analysis, model fitting, anisotropy, kriging uncertainty, validation metrics, and residual diagnostics. Engineering controls condition kriging estimates and validation predictions, but they are excluded from experimental variograms, variogram auto-fit, LOOCV target sets, and validation metrics.
+Ordinary Kriging and Universal Kriging are configured inside Mapping Studio. Ordinary Kriging uses the constant-mean assumption. Universal Kriging supports a deterministic XY trend, starting with Linear XY and optionally Quadratic XY. Variogram model, auto-fit/manual mode, practical range, sill/variance, nugget, anisotropy, local-neighborhood settings, uncertainty display, and compact diagnostics remain available without exposing a standalone geostatistics page in normal navigation.
+
+Natural Neighbor uses bounded Voronoi-cell area weights. It honors conditioning points exactly and does not extrapolate outside the conditioning-point support. Because it computes true bounded cell intersections, it is conservative and can be slower on large grids.
+
+Minimum Curvature is implemented as a thin-plate spline biharmonic minimum-bending-energy surface with optional smoothing. It generates a global smooth surface over the selected computational domain before masks are applied.
+
+Convergent Interpolation is Reservoir Mapping Studio's iterative convergent interpolation implementation inspired by standard iterative surface-conditioning concepts. It is not an exact Petrel algorithm reproduction. The implementation builds an initial smooth surface, samples that surface at conditioning points, computes residuals as `Observed - Estimated`, interpolates residual corrections, updates the surface with a relaxation factor, and repeats until RMSE reaches the target tolerance, RMSE improvement falls below tolerance, or maximum iterations is reached. Generated maps store iterations, initial RMSE, final RMSE, tolerance, convergence status, and RMSE history.
+
+Engineering controls condition interpolation estimates, but they are not measured truth. Validation metrics preserve the measured/synthetic distinction and do not let synthetic controls artificially improve measured LOOCV statistics.
 
 ## Exports
 
@@ -211,20 +222,6 @@ python -B -m pytest -q
 python -B -c "import app"
 ```
 
-## Known Limitations
-
-This V1 is intentionally focused and not a full GIS or reservoir modeling platform. It does not implement:
-
-- Petrel replacement
-- full GIS system
-- 3D geological grids
-- dynamic simulation
-- material balance
-- co-kriging
-- sequential Gaussian simulation
-- universal kriging beyond the existing scope
-- database backend / authentication
-
 ## Optional Features Policy
 
 Secondary features such as ZMAP, GeoTIFF, and PDF export are wired through the shared V1 export helpers so grid orientation, CRS metadata, NoData, and scenario snapshots remain consistent. Core engineering flow remains the priority: project persistence, saved maps, comparison, delta maps, and export quality.
@@ -232,8 +229,6 @@ Secondary features such as ZMAP, GeoTIFF, and PDF export are wired through the s
 - Observed vs Predicted scatter with a 1:1 reference line
 - Residual histogram
 - Residual map with signed residual color and absolute-error marker sizing
-
-These diagnostics live in the Geostatistics Lab so the main map remains focused on map generation.
 
 ## Algorithm Comparison
 
@@ -283,7 +278,7 @@ Reservoir Mapping Studio V1 writes a documented ZMAP-style gridded ASCII dialect
 
 ZMAP exports preserve projected or local Cartesian X/Y values exactly. EPSG:32638 and Custom EPSG settings are recorded in comments and companion metadata JSON; Local / Unknown XY records the coordinate unit and unknown CRS state. All-layer export writes one ZMAP file per generated Reservoir Layer. This is described as ZMAP Grid ASCII / RMS V1 ZMAP-style gridded ASCII; no Petrel compatibility claim is made without external import validation.
 
-Cross-validation results can be downloaded as CSV or Excel from the Geostatistics Lab.
+Kriging diagnostics and validation exports remain available through the Mapping Studio workflow and supporting geostatistics modules. The standalone Geostatistics Lab page is hidden from normal V1 navigation, but the backend modules are still used for Ordinary Kriging, Universal Kriging, variogram models, validation, and uncertainty.
 
 ## Sample Data
 
@@ -306,10 +301,10 @@ python -m compileall .
 python -m pytest -q
 ```
 
-The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, PASS 4.1 spatial domain decoupling, stale map signatures, engineering control scoping/conditioning/persistence, pressure-change guards, CRS round trips, GeoTIFF and ZMAP round trips, and project persistence.
+The automated suite covers Level 1.1 regression behavior plus Level 2 geometry masks, panel assignment, overlap detection, compartment interpolation, variogram calculation, candidate fitting, kriging estimate/uncertainty output, validation metrics, explicit Reservoir Layer generation, all-layer batches, PASS 4.1 spatial domain decoupling, stale map signatures, engineering control scoping/conditioning/persistence, pressure-change guards, CRS round trips, GeoTIFF and ZMAP round trips, saved-scenario display switching, contour-line toggling, advanced interpolation methods, and project persistence.
 
 ## Current Limitations
 
-This level does not implement CRS reprojection/transformation, barrier/fault Kriging, Universal Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, 3D mapping, corner-point grids, interactive GIS vertex editing, database backend/authentication, pressure datum-depth correction, or temporal pressure extrapolation.
+This level does not implement CRS reprojection/transformation, barrier/fault Kriging, Regression Kriging, Co-Kriging, Sequential Gaussian Simulation, 3D mapping, corner-point grids, interactive GIS vertex editing, database backend/authentication, pressure datum-depth correction, or temporal pressure extrapolation.
 
 Static PNG, SVG, and PDF image export uses Plotly/Kaleido. If Kaleido is missing or unavailable, the app shows an export failure message instead of crashing.

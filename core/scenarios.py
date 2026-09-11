@@ -125,7 +125,9 @@ def create_map_scenario(
         "y_col": generated_map.get("y_col"),
         "well_col": generated_map.get("well_col"),
         "interpolation_method": generated_map.get("method"),
+        "interpolation_family": generated_map.get("interpolation_family", ""),
         "interpolation_parameters": json_safe(generated_map.get("method_parameters", {})),
+        "interpolation_metadata": json_safe(generated_map.get("interpolation_metadata", {})),
         "grid_parameters": json_safe(generated_map.get("grid_parameters", {})),
         "interpolation_domain": generated_map.get("interpolation_domain"),
         "reservoir_layer": generated_map.get("reservoir_layer"),
@@ -184,13 +186,15 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
     if not isinstance(engineering_controls, pd.DataFrame):
         engineering_controls = pd.DataFrame(engineering_controls)
     return {
-        "grid_x": np.asarray(scenario["grid_x"], dtype=float),
-        "grid_y": np.asarray(scenario["grid_y"], dtype=float),
-        "grid_z": np.asarray(scenario["grid_z"], dtype=float),
+        "grid_x": np.asarray(scenario["grid_x"], dtype=float).copy(),
+        "grid_y": np.asarray(scenario["grid_y"], dtype=float).copy(),
+        "grid_z": np.asarray(scenario["grid_z"], dtype=float).copy(),
         "grid_variance": None
         if scenario.get("grid_variance") is None
-        else np.asarray(scenario["grid_variance"], dtype=float),
-        "panel_grid": scenario.get("panel_grid"),
+        else np.asarray(scenario["grid_variance"], dtype=float).copy(),
+        "panel_grid": None
+        if scenario.get("panel_grid") is None
+        else np.asarray(scenario["panel_grid"], dtype=object).copy(),
         "included_observations": scenario.get("included_observations", pd.DataFrame()).copy(),
         "excluded_observations": scenario.get("excluded_observations", pd.DataFrame()).copy(),
         "property_col": scenario.get("property"),
@@ -206,7 +210,9 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "measurement_date_col": scenario.get("measurement_date_col"),
         "map_reference_date_col": scenario.get("map_reference_date_col"),
         "method": scenario.get("interpolation_method"),
+        "interpolation_family": scenario.get("interpolation_family", ""),
         "method_parameters": deepcopy(scenario.get("interpolation_parameters", {})),
+        "interpolation_metadata": deepcopy(scenario.get("interpolation_metadata", {})),
         "grid_parameters": deepcopy(scenario.get("grid_parameters", {})),
         "interpolation_domain": scenario.get("interpolation_domain"),
         "reservoir_layer": scenario.get("reservoir_layer"),
@@ -223,6 +229,8 @@ def scenario_to_generated_map(scenario: dict[str, object]) -> dict[str, object]:
         "selected_layers": deepcopy(scenario.get("selected_layers", [])),
         "geometry_context": deepcopy(scenario.get("geometry_context", {})),
         "geometry_references": deepcopy(scenario.get("geometry_references", {})),
+        "display_style_settings": deepcopy(scenario.get("style_settings", {})),
+        "display_layer_settings": deepcopy(scenario.get("layer_settings", {})),
         "duplicate_method": scenario.get("duplicate_method"),
         "hover_columns": deepcopy(scenario.get("hover_columns", [])),
         "title": scenario.get("title") or scenario.get("name"),
@@ -273,6 +281,69 @@ def scenario_summary_table(scenarios: list[dict[str, object]]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def scenario_display_label(scenario: dict[str, object]) -> str:
+    """Return a human-readable scenario label while keeping ID separate."""
+
+    property_name = str(scenario.get("property") or scenario.get("name") or "Map")
+    parts = [property_name]
+    if bool(scenario.get("is_pressure_map")) and scenario.get("pressure_reference_date"):
+        formatted_date = scenario.get("pressure_reference_date")
+        try:
+            formatted_date = pd.to_datetime(formatted_date).strftime("%d-%b-%Y")
+        except Exception:
+            pass
+        parts.append(str(formatted_date))
+    layer = scenario.get("reservoir_layer") or ", ".join(scenario.get("selected_layers", []) or [])
+    if layer:
+        parts.append(str(layer))
+    method = scenario.get("interpolation_method")
+    if method:
+        parts.append(str(method))
+    return " | ".join(parts)
+
+
+def scenario_by_id(scenarios: list[dict[str, object]], scenario_id: str | None) -> dict[str, object] | None:
+    if not scenario_id:
+        return None
+    for scenario in scenarios or []:
+        if str(scenario.get("id") or "") == str(scenario_id):
+            return scenario
+    return None
+
+
+def validate_scenario_snapshot(scenario: dict[str, object]) -> list[str]:
+    errors: list[str] = []
+    for key in ("id", "grid_x", "grid_y", "grid_z", "property", "interpolation_method"):
+        if key not in scenario or scenario.get(key) is None:
+            errors.append(f"missing {key}")
+    try:
+        grid_x = np.asarray(scenario.get("grid_x"), dtype=float)
+        grid_y = np.asarray(scenario.get("grid_y"), dtype=float)
+        grid_z = np.asarray(scenario.get("grid_z"), dtype=float)
+        if grid_x.shape != grid_y.shape or grid_x.shape != grid_z.shape or grid_z.ndim != 2:
+            errors.append("grid arrays must be 2-D with matching shapes")
+    except Exception:
+        errors.append("grid arrays are not numeric")
+    if scenario.get("grid_variance") is not None:
+        try:
+            if np.asarray(scenario.get("grid_variance"), dtype=float).shape != np.asarray(scenario.get("grid_z"), dtype=float).shape:
+                errors.append("uncertainty grid shape does not match property grid")
+        except Exception:
+            errors.append("uncertainty grid is not numeric")
+    return errors
+
+
+def safe_scenario_to_generated_map(scenario: dict[str, object]) -> tuple[dict[str, object] | None, list[str]]:
+    errors = validate_scenario_snapshot(scenario)
+    if errors:
+        return None, errors
+    try:
+        generated = scenario_to_generated_map(scenario)
+    except Exception as exc:
+        return None, [str(exc)]
+    return generated, []
 
 
 def _grid_label(scenario: dict[str, object]) -> str:
