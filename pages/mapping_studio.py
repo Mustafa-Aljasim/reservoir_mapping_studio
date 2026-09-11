@@ -76,9 +76,32 @@ from core.plotting.engineering_controls import add_control_region_overlays, add_
 from core.plotting.map_builder import (
     build_context_map_figure,
     build_map_figure,
-    map_figure_for_static_export,
     move_observation_traces_to_top,
 )
+try:
+    from core.plotting.map_builder import map_figure_for_static_export
+except ImportError:
+    def map_figure_for_static_export(
+        figure: go.Figure,
+        *,
+        include_raw_points: bool = True,
+        include_excluded_observations: bool = True,
+        include_engineering_controls: bool = True,
+        include_control_regions: bool = True,
+    ) -> go.Figure:
+        export_figure = go.Figure(figure.to_plotly_json())
+        hidden_names: set[str] = set()
+        if not include_raw_points:
+            hidden_names.update({"Raw measured points", "Included wells"})
+        if not include_excluded_observations:
+            hidden_names.add("Excluded observations")
+        if not include_engineering_controls:
+            hidden_names.update({"Engineering controls", "Region controls", "Control location preview"})
+        if not include_control_regions:
+            hidden_names.add("Control regions")
+        if hidden_names:
+            export_figure.data = tuple(trace for trace in export_figure.data if trace.name not in hidden_names)
+        return export_figure
 from core.plotting.styling import format_numeric
 from core.scenarios import (
     create_map_scenario,
