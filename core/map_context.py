@@ -102,7 +102,7 @@ def build_map_metadata(
         "Control_Point_IDs": ", ".join(str(value) for value in (control_point_ids or [])),
         "Control_Region_IDs": ", ".join(str(value) for value in (control_region_ids or [])),
         "Variogram_Range_Convention": method_parameters.get("variogram_range_convention", "Practical Range")
-        if interpolation_method == "Ordinary Kriging"
+        if interpolation_method in {"Ordinary Kriging", "Universal Kriging"}
         else "",
     }
     if model_signature_hash:

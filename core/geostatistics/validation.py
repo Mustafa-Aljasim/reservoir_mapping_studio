@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.geostatistics.kriging import kriging_predict_point
+from core.geostatistics.kriging import kriging_predict_point, universal_kriging_interpolate
 from core.interpolation.idw import idw_interpolate
 
 
@@ -47,6 +47,18 @@ def _predict_idw(train: pd.DataFrame, row: pd.Series, parameters: dict) -> float
 def _predict_kriging(train: pd.DataFrame, row: pd.Series, parameters: dict) -> float:
     estimate, _ = kriging_predict_point(train["X"], train["Y"], train["Z"], float(row["X"]), float(row["Y"]), parameters)
     return estimate
+
+
+def _predict_universal_kriging(train: pd.DataFrame, row: pd.Series, parameters: dict) -> float:
+    result = universal_kriging_interpolate(
+        train["X"],
+        train["Y"],
+        train["Z"],
+        np.asarray([[row["X"]]], dtype=float),
+        np.asarray([[row["Y"]]], dtype=float),
+        parameters,
+    )
+    return float(result.estimate[0, 0])
 
 
 def leave_one_out_cross_validation(
@@ -112,6 +124,8 @@ def leave_one_out_cross_validation(
                 predicted = _predict_idw(train, row, parameters)
             elif method_key in {"ordinary_kriging", "kriging"}:
                 predicted = _predict_kriging(train, row, parameters)
+            elif method_key == "universal_kriging":
+                predicted = _predict_universal_kriging(train, row, parameters)
         except Exception:
             predicted = np.nan
         observed = float(row["Z"])

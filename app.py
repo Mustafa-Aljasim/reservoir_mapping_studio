@@ -45,7 +45,6 @@ def main() -> None:
         st.Page("pages/project.py", title="Project", icon=":material/folder_open:"),
         st.Page("pages/data_manager.py", title="Data Manager", icon=":material/table:"),
         st.Page("pages/mapping_studio.py", title="Mapping Studio", icon=":material/map:"),
-        st.Page("pages/geostatistics_lab.py", title="Geostatistics Lab", icon=":material/scatter_plot:"),
         st.Page("pages/map_comparison.py", title="Map Comparison", icon=":material/compare:"),
     ]
     navigation = st.navigation(pages)

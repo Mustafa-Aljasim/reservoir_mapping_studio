@@ -106,7 +106,17 @@ GRID_PRESETS = {
     "Custom": None,
 }
 
-INTERPOLATION_METHODS = ("IDW", "Linear", "Cubic", "RBF", "Ordinary Kriging")
+INTERPOLATION_METHOD_FAMILIES = {
+    "Basic": ("IDW", "Linear", "Cubic", "RBF"),
+    "Geological / Surface": ("Natural Neighbor", "Minimum Curvature", "Convergent Interpolation"),
+    "Geostatistical": ("Ordinary Kriging", "Universal Kriging"),
+}
+
+INTERPOLATION_METHODS = tuple(
+    method
+    for methods in INTERPOLATION_METHOD_FAMILIES.values()
+    for method in methods
+)
 
 DUPLICATE_METHODS = ("Average", "Median", "Keep first", "Keep last")
 

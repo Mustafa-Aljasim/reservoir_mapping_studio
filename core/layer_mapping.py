@@ -142,7 +142,7 @@ def resolve_layer_method_parameters(
     prepared: pd.DataFrame,
 ) -> dict[str, object]:
     parameters = dict(method_parameters or {})
-    if method != "Ordinary Kriging" or parameters.get("variogram_mode") != "Auto Fit":
+    if method not in {"Ordinary Kriging", "Universal Kriging"} or parameters.get("variogram_mode") != "Auto Fit":
         return parameters
     values = pd.to_numeric(prepared["Z"], errors="coerce").dropna()
     if len(prepared) < 5 or values.nunique() <= 1:
@@ -188,7 +188,7 @@ def batch_signature_dataframe(
         property_type,
         pressure_reference_date,
         filter_values_excluding_semantics(mappings, filter_values, ("layer",)),
-        selected_panels if panel_layer is not None else None,
+        selected_panels if mappings.get("panel") and selected_panels else None,
         selected_layers=selected_layers,
     )
     filtered = active.dataframe
@@ -311,7 +311,7 @@ def _interpolate_layer_surface(
     reservoir_boundary_layer: GeometryLayer | None,
     selected_panels: list[object] | tuple[object, ...],
     dataset_panel_col: str | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, dict[str, object], dict[str, object]]:
     grid_x, grid_y = generate_grid(
         prepared["X"],
         prepared["Y"],
@@ -348,6 +348,7 @@ def _interpolate_layer_surface(
         mask_info["panel_constraint"] = True
         mask_info["compartment_warnings"] = result.warnings
         panel_grid = result.panel_grid
+        interpolation_metadata = {}
     else:
         surface = interpolate_surface_result(
             prepared["X"],
@@ -372,9 +373,10 @@ def _interpolate_layer_surface(
         )
         mask_info["panel_constraint"] = False
         panel_grid = None
+        interpolation_metadata = dict(surface.metadata or {})
     if int(mask_info.get("valid_grid_cells", 0)) == 0:
         raise ValueError("Generated surface has no finite cells after masks were applied.")
-    return grid_x, grid_y, grid_z, grid_variance, panel_grid, mask_info
+    return grid_x, grid_y, grid_z, grid_variance, panel_grid, mask_info, interpolation_metadata
 
 
 def build_layer_model_signature(
@@ -405,7 +407,8 @@ def build_layer_model_signature(
         "variance": interpolation_parameters.get("variance"),
         "nugget": interpolation_parameters.get("nugget"),
         "range_convention": interpolation_parameters.get("variogram_range_convention"),
-    } if interpolation_method == "Ordinary Kriging" else {}
+        "trend_model": interpolation_parameters.get("trend_model"),
+    } if interpolation_method in {"Ordinary Kriging", "Universal Kriging"} else {}
     return build_model_signature(
         property_column=property_column,
         property_type=property_type,
@@ -461,7 +464,7 @@ def prepare_layer_observations(
         property_type,
         pressure_reference_date,
         filter_values_excluding_semantics(mappings, filter_values, ("layer",)),
-        selected_panels if panel_layer is not None else None,
+        selected_panels if mappings.get("panel") and selected_panels else None,
         selected_layers=layer_values,
     )
     filtered = active.dataframe
@@ -583,7 +586,7 @@ def generate_single_layer_map(
             f"{layer_name} has insufficient data ({len(conditioning_prepared)} available, {minimum} required)."
         )
     layer_parameters = resolve_layer_method_parameters(interpolation_method, interpolation_parameters, prepared)
-    grid_x, grid_y, grid_z, grid_variance, panel_grid, mask_info = _interpolate_layer_surface(
+    grid_x, grid_y, grid_z, grid_variance, panel_grid, mask_info, interpolation_metadata = _interpolate_layer_surface(
         conditioning_prepared,
         interpolation_method,
         layer_parameters,
@@ -680,6 +683,10 @@ def generate_single_layer_map(
     )
     export_metadata["Interpolation_Domain_Type"] = interpolation_domain
     export_metadata["Domain_Geometry_Source"] = domain_geometry_source(interpolation_domain)
+    for key, value in interpolation_metadata.items():
+        if key == "rmse_history":
+            continue
+        export_metadata[f"Method_{key}"] = value
     if domain_bounds is not None:
         export_metadata["Domain_Bounds"] = {
             "min_x": float(domain_bounds[0]),
@@ -748,6 +755,7 @@ def generate_single_layer_map(
         "map_reference_date_col": mappings.get("map_reference_date"),
         "method": interpolation_method,
         "method_parameters": layer_parameters,
+        "interpolation_metadata": interpolation_metadata,
         "grid_parameters": grid_parameters,
         "mask_parameters": mask_parameters,
         "interpolation_domain": interpolation_domain,
@@ -854,7 +862,7 @@ def generate_layer_map_collection(
     scope = normalize_layer_scope(layer_scope)
     filter_values_no_layer = filter_values_excluding_semantics(mappings, filter_values, ("layer",))
     if layer_column(mappings):
-        panel_selection_for_layers = selected_panels if panel_layer is not None and mappings.get("panel") else None
+        panel_selection_for_layers = selected_panels if mappings.get("panel") and selected_panels else None
         active_for_layers = prepare_active_property_data(
             dataframe,
             mappings,

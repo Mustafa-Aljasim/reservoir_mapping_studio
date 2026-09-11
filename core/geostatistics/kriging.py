@@ -67,6 +67,8 @@ def _krige_points(
     query_x: np.ndarray,
     query_y: np.ndarray,
     parameters: dict,
+    *,
+    universal: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     model = _gstools_model(
         parameters.get("variogram_model", "Spherical"),
@@ -79,29 +81,40 @@ def _krige_points(
     )
     import gstools as gs
 
-    ok = gs.krige.Ordinary(model, cond_pos=[x, y], cond_val=z)
+    if universal:
+        trend_model = str(parameters.get("trend_model", "Linear XY"))
+        if trend_model == "Quadratic XY":
+            drift_functions = "quadratic"
+        else:
+            drift_functions = "linear"
+        ok = gs.krige.Universal(model, cond_pos=[x, y], cond_val=z, drift_functions=drift_functions)
+    else:
+        ok = gs.krige.Ordinary(model, cond_pos=[x, y], cond_val=z)
     estimate, variance = ok((query_x, query_y), mesh_type="unstructured", return_var=True)
     return np.asarray(estimate, dtype=float), np.asarray(variance, dtype=float)
 
 
-def ordinary_kriging_interpolate(
+def _kriging_interpolate(
     x,
     y,
     z,
     grid_x: np.ndarray,
     grid_y: np.ndarray,
     parameters: dict | None = None,
+    *,
+    universal: bool = False,
 ) -> KrigingResult:
-    """Return Ordinary Kriging estimate and variance surfaces."""
-
     parameters = parameters or {}
     x_array, y_array, z_array = _clean_xyz(x, y, z)
     if len(z_array) < 3:
-        raise ValueError("At least 3 finite observations are required for Ordinary Kriging.")
+        name = "Universal Kriging" if universal else "Ordinary Kriging"
+        raise ValueError(f"At least 3 finite observations are required for {name}.")
     if not non_collinear_points(x_array, y_array):
-        raise ValueError("At least 3 non-collinear observations are required for Ordinary Kriging.")
+        name = "Universal Kriging" if universal else "Ordinary Kriging"
+        raise ValueError(f"At least 3 non-collinear observations are required for {name}.")
     if np.nanvar(z_array) == 0:
-        raise ValueError("All active property values are identical. Ordinary Kriging cannot estimate a meaningful variogram.")
+        name = "Universal Kriging" if universal else "Ordinary Kriging"
+        raise ValueError(f"All active property values are identical. {name} cannot estimate a meaningful variogram.")
 
     query = np.column_stack([grid_x.ravel(), grid_y.ravel()])
     max_neighbors = parameters.get("max_neighbors")
@@ -109,7 +122,15 @@ def ordinary_kriging_interpolate(
     use_local = (max_neighbors is not None and int(max_neighbors) < len(z_array)) or search_radius is not None
 
     if not use_local:
-        estimate, variance = _krige_points(x_array, y_array, z_array, query[:, 0], query[:, 1], parameters)
+        estimate, variance = _krige_points(
+            x_array,
+            y_array,
+            z_array,
+            query[:, 0],
+            query[:, 1],
+            parameters,
+            universal=universal,
+        )
         return KrigingResult(estimate.reshape(grid_x.shape), variance.reshape(grid_x.shape))
 
     tree = cKDTree(np.column_stack([x_array, y_array]))
@@ -132,12 +153,39 @@ def ordinary_kriging_interpolate(
                 np.asarray([point[0]]),
                 np.asarray([point[1]]),
                 parameters,
+                universal=universal,
             )
         except ValueError:
             continue
         estimates[index] = estimate[0]
         variances[index] = variance[0]
     return KrigingResult(estimates.reshape(grid_x.shape), variances.reshape(grid_x.shape))
+
+
+def ordinary_kriging_interpolate(
+    x,
+    y,
+    z,
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    parameters: dict | None = None,
+) -> KrigingResult:
+    """Return Ordinary Kriging estimate and variance surfaces."""
+
+    return _kriging_interpolate(x, y, z, grid_x, grid_y, parameters, universal=False)
+
+
+def universal_kriging_interpolate(
+    x,
+    y,
+    z,
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    parameters: dict | None = None,
+) -> KrigingResult:
+    """Return Universal Kriging estimate and variance surfaces with XY drift."""
+
+    return _kriging_interpolate(x, y, z, grid_x, grid_y, parameters, universal=True)
 
 
 def kriging_predict_point(x, y, z, point_x: float, point_y: float, parameters: dict | None = None) -> tuple[float, float]:

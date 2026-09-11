@@ -17,7 +17,14 @@ OBSERVATION_TRACE_NAMES = {
     "Excluded observations",
     "Engineering controls",
     "Region controls",
+    "Control regions",
+    "Control location preview",
 }
+
+RAW_POINT_TRACE_NAMES = {"Raw measured points", "Included wells"}
+EXCLUDED_POINT_TRACE_NAMES = {"Excluded observations"}
+ENGINEERING_CONTROL_TRACE_NAMES = {"Engineering controls", "Region controls", "Control location preview"}
+CONTROL_REGION_TRACE_NAMES = {"Control regions"}
 
 
 def move_observation_traces_to_top(figure: go.Figure) -> None:
@@ -31,6 +38,31 @@ def move_observation_traces_to_top(figure: go.Figure) -> None:
         else:
             base_traces.append(trace)
     figure.data = tuple(base_traces + observation_traces)
+
+
+def map_figure_for_static_export(
+    figure: go.Figure,
+    *,
+    include_raw_points: bool = True,
+    include_excluded_observations: bool = True,
+    include_engineering_controls: bool = True,
+    include_control_regions: bool = True,
+) -> go.Figure:
+    """Return a copy of a map figure with export-only overlay visibility applied."""
+
+    export_figure = go.Figure(figure.to_plotly_json())
+    hidden_names: set[str] = set()
+    if not include_raw_points:
+        hidden_names.update(RAW_POINT_TRACE_NAMES)
+    if not include_excluded_observations:
+        hidden_names.update(EXCLUDED_POINT_TRACE_NAMES)
+    if not include_engineering_controls:
+        hidden_names.update(ENGINEERING_CONTROL_TRACE_NAMES)
+    if not include_control_regions:
+        hidden_names.update(CONTROL_REGION_TRACE_NAMES)
+    if hidden_names:
+        export_figure.data = tuple(trace for trace in export_figure.data if trace.name not in hidden_names)
+    return export_figure
 
 
 def _build_hover_text(
@@ -64,7 +96,7 @@ def _build_hover_text(
             if measurement_date_col and measurement_date_col in df.columns and pd.notna(row.get(measurement_date_col)):
                 measurement_value = row.get(measurement_date_col)
                 lines.append(f"Original Measurement Date: {format_map_date(measurement_value)}")
-                age_days = measurement_age_days(measurement_value, map_reference_date)
+                age_days = measurement_age_days(measurement_value, reference_value)
                 if age_days is not None:
                     lines.append(f"Original Measurement Age: {age_days:,} days")
         lines.append(f"{x_col}: {format_numeric(row.get(x_col))} {distance_unit}")
@@ -258,10 +290,12 @@ def build_map_figure(
     if z_range_mode == "Manual" and zmin is not None and zmax is not None and zmin >= zmax:
         zmin = zmax = None
 
+    show_contour_lines = bool(style.get("show_contour_lines", True))
+    show_contour_labels = show_contour_lines and bool(style.get("show_contour_labels", False))
     contours = {
         "coloring": "heatmap",
-        "showlines": bool(style.get("show_contour_lines", True)),
-        "showlabels": bool(style.get("show_contour_labels", False)),
+        "showlines": show_contour_lines,
+        "showlabels": show_contour_labels,
     }
     if style.get("contour_mode", "Auto interval") == "Manual interval" and valid_z.size:
         interval = float(style.get("contour_interval") or 0)
@@ -281,7 +315,7 @@ def build_map_figure(
             zmin=zmin,
             zmax=zmax,
             contours=contours,
-            line={"width": float(style.get("contour_line_width", 0.75))},
+            line={"width": float(style.get("contour_line_width", 0.75)) if show_contour_lines else 0.0},
             colorbar={"title": colorbar_title},
             visible=bool(style.get("show_surface", True)),
             hovertemplate=(

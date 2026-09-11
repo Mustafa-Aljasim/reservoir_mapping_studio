@@ -155,6 +155,7 @@ def test_invalid_measurement_date_is_reported_but_data_can_remain():
 
 def test_measurement_age_is_informational():
     assert measurement_age_days("2025-03-15", date(2026, 1, 1)) == 292
+    assert measurement_age_days("2025-03-15", "2026-01-01") == 292
 
 
 def test_pressure_title_contains_reference_date_but_generic_title_does_not():
@@ -175,4 +176,3 @@ def test_pressure_title_contains_reference_date_but_generic_title_does_not():
     assert "Reference Date: 01-Jan-2026" in pressure_title
     assert "Reference Date" not in generic_title
     assert format_map_date(date(2026, 1, 1)) == "01-Jan-2026"
-
