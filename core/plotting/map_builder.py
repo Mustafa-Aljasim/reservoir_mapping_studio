@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from core.pressure_dates import format_map_date, measurement_age_days
+from core.plotting.map_style import MapStyle
 from core.plotting.styling import format_numeric, property_display_name
 from utils.units import axis_title, coordinate_unit_symbol
 
@@ -118,27 +119,6 @@ def _build_hover_text(
     return hover_text
 
 
-def _label_text(
-    df: pd.DataFrame,
-    property_col: str,
-    well_col: str | None,
-    mode: str,
-) -> list[str] | None:
-    if mode == "None":
-        return None
-    labels: list[str] = []
-    for _, row in df.iterrows():
-        well = str(row.get(well_col, "")) if well_col and pd.notna(row.get(well_col)) else ""
-        value = format_numeric(row.get(property_col))
-        if mode == "Well Name":
-            labels.append(well)
-        elif mode == "Property Value":
-            labels.append(value)
-        else:
-            labels.append(f"{well}<br>{value}" if well else value)
-    return labels
-
-
 def build_context_map_figure(
     included_observations: pd.DataFrame,
     excluded_observations: pd.DataFrame,
@@ -158,35 +138,42 @@ def build_context_map_figure(
 ) -> go.Figure:
     """Build a Cartesian context map before a property surface exists."""
 
-    style = style or {}
+    map_style = MapStyle.from_settings(style, well_col=well_col, generated_surface=False)
     hover_columns = hover_columns or []
     observation_label = property_display_name(property_col, unit)
     x_axis_title = axis_title(x_col, coordinate_unit)
     y_axis_title = axis_title(y_col, coordinate_unit)
     figure = go.Figure()
 
-    show_raw_points = bool(style.get("show_raw_points", style.get("show_wells", True)))
+    show_raw_points = map_style.show_wells
     if show_raw_points and not included_observations.empty:
-        label_mode = str(style.get("well_label_mode", "None"))
-        labels = _label_text(included_observations, property_col, well_col, label_mode)
+        labels = map_style.visible_well_labels(
+            included_observations,
+            x_col=x_col,
+            y_col=y_col,
+            property_col=property_col,
+            well_col=well_col,
+            unit=unit,
+        )
+        has_visible_labels = bool(labels) and any(labels)
         figure.add_trace(
             go.Scatter(
                 x=pd.to_numeric(included_observations[x_col], errors="coerce"),
                 y=pd.to_numeric(included_observations[y_col], errors="coerce"),
-                mode="markers+text" if labels else "markers",
+                mode="markers+text" if has_visible_labels else "markers",
                 marker={
-                    "size": int(style.get("marker_size", 9)),
+                    "size": map_style.marker_size,
                     "color": "#0F766E",
-                    "opacity": float(style.get("marker_opacity", 0.92)),
+                    "opacity": map_style.marker_opacity,
                     "symbol": "circle",
                     "line": {
-                        "width": 1.5 if bool(style.get("marker_outline", True)) else 0,
+                        "width": 1.5 if map_style.marker_outline else 0,
                         "color": "#FFFFFF",
                     },
                 },
                 text=labels,
-                textposition="top center",
-                textfont={"size": int(style.get("label_text_size", 11)), "color": "#0F172A"},
+                textposition=map_style.well_label_position,
+                textfont={"size": map_style.well_label_font_size, "color": "#0F172A"},
                 hovertext=_build_hover_text(
                     included_observations,
                     x_col,
@@ -206,14 +193,14 @@ def build_context_map_figure(
             )
         )
 
-    if bool(style.get("show_excluded", True)) and not excluded_observations.empty:
+    if map_style.show_excluded and not excluded_observations.empty:
         figure.add_trace(
             go.Scatter(
                 x=pd.to_numeric(excluded_observations[x_col], errors="coerce"),
                 y=pd.to_numeric(excluded_observations[y_col], errors="coerce"),
                 mode="markers",
                 marker={
-                    "size": max(int(style.get("marker_size", 9)), 10),
+                    "size": max(map_style.marker_size, 10),
                     "color": "#6B7280",
                     "opacity": 0.8,
                     "symbol": "x",
@@ -239,15 +226,28 @@ def build_context_map_figure(
         )
 
     figure.update_layout(
-        title=title or f"{property_col} Base Map",
+        title={"text": title or f"{property_col} Base Map", "font": {"size": map_style.title_font_size}},
         template="plotly_white",
-        height=int(style.get("height", 720)),
+        height=map_style.height,
         margin={"l": 30, "r": 30, "t": 70, "b": 30},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "left", "x": 0},
         hovermode="closest",
+        font={"size": map_style.axis_font_size},
     )
-    figure.update_xaxes(title_text=x_axis_title, zeroline=False)
-    figure.update_yaxes(title_text=y_axis_title, zeroline=False, scaleanchor="x", scaleratio=1)
+    figure.update_xaxes(
+        title_text=x_axis_title,
+        title_font={"size": map_style.axis_font_size},
+        tickfont={"size": map_style.axis_font_size},
+        zeroline=False,
+    )
+    figure.update_yaxes(
+        title_text=y_axis_title,
+        title_font={"size": map_style.axis_font_size},
+        tickfont={"size": map_style.axis_font_size},
+        zeroline=False,
+        scaleanchor="x",
+        scaleratio=1,
+    )
     return figure
 
 
@@ -275,7 +275,7 @@ def build_map_figure(
 ) -> go.Figure:
     """Build a Cartesian Plotly filled-contour map with well overlays."""
 
-    style = style or {}
+    map_style = MapStyle.from_settings(style, well_col=well_col, generated_surface=True)
     hover_columns = hover_columns or []
     observation_label = property_display_name(property_col, unit)
     colorbar_title = property_display_name(surface_label or property_col, surface_unit if surface_unit is not None else unit)
@@ -284,21 +284,20 @@ def build_map_figure(
 
     finite_z = np.asarray(grid_z, dtype=float)
     valid_z = finite_z[np.isfinite(finite_z)]
-    z_range_mode = style.get("z_range_mode", "Auto")
-    zmin = style.get("zmin") if z_range_mode == "Manual" else None
-    zmax = style.get("zmax") if z_range_mode == "Manual" else None
+    z_range_mode = map_style.z_range_mode
+    zmin = map_style.zmin if z_range_mode == "Manual" else None
+    zmax = map_style.zmax if z_range_mode == "Manual" else None
     if z_range_mode == "Manual" and zmin is not None and zmax is not None and zmin >= zmax:
         zmin = zmax = None
 
-    show_contour_lines = bool(style.get("show_contour_lines", True))
-    show_contour_labels = show_contour_lines and bool(style.get("show_contour_labels", False))
     contours = {
         "coloring": "heatmap",
-        "showlines": show_contour_lines,
-        "showlabels": show_contour_labels,
+        "showlines": map_style.show_contour_lines,
+        "showlabels": map_style.show_contour_labels,
+        "labelfont": {"size": map_style.contour_label_font_size},
     }
-    if style.get("contour_mode", "Auto interval") == "Manual interval" and valid_z.size:
-        interval = float(style.get("contour_interval") or 0)
+    if map_style.contour_mode == "Manual interval" and valid_z.size:
+        interval = float(map_style.contour_interval or 0)
         if interval > 0:
             start = float(zmin) if zmin is not None else float(np.nanmin(valid_z))
             end = float(zmax) if zmax is not None else float(np.nanmax(valid_z))
@@ -310,14 +309,17 @@ def build_map_figure(
             x=grid_x[0, :],
             y=grid_y[:, 0],
             z=grid_z,
-            colorscale=style.get("color_scale", "Turbo"),
-            reversescale=bool(style.get("reverse_colors", False)),
+            colorscale=map_style.color_scale,
+            reversescale=map_style.reverse_colors,
             zmin=zmin,
             zmax=zmax,
             contours=contours,
-            line={"width": float(style.get("contour_line_width", 0.75)) if show_contour_lines else 0.0},
-            colorbar={"title": colorbar_title},
-            visible=bool(style.get("show_surface", True)),
+            line={"width": map_style.contour_line_width if map_style.show_contour_lines else 0.0},
+            colorbar={
+                "title": {"text": colorbar_title, "font": {"size": map_style.colorbar_font_size}},
+                "tickfont": {"size": map_style.colorbar_font_size},
+            },
+            visible=map_style.show_surface,
             hovertemplate=(
                 f"{x_axis_title}: %{{x:.3f}}<br>"
                 f"{y_axis_title}: %{{y:.3f}}<br>"
@@ -327,27 +329,34 @@ def build_map_figure(
         )
     )
 
-    if bool(style.get("show_wells", True)) and not included_observations.empty:
-        label_mode = str(style.get("well_label_mode", "None"))
-        labels = _label_text(included_observations, property_col, well_col, label_mode)
+    if map_style.show_wells and not included_observations.empty:
+        labels = map_style.visible_well_labels(
+            included_observations,
+            x_col=x_col,
+            y_col=y_col,
+            property_col=property_col,
+            well_col=well_col,
+            unit=unit,
+        )
+        has_visible_labels = bool(labels) and any(labels)
         figure.add_trace(
             go.Scatter(
                 x=pd.to_numeric(included_observations[x_col], errors="coerce"),
                 y=pd.to_numeric(included_observations[y_col], errors="coerce"),
-                mode="markers+text" if labels else "markers",
+                mode="markers+text" if has_visible_labels else "markers",
                 marker={
-                    "size": int(style.get("marker_size", 9)),
+                    "size": map_style.marker_size,
                     "color": "#111827",
-                    "opacity": float(style.get("marker_opacity", 0.9)),
+                    "opacity": map_style.marker_opacity,
                     "symbol": "circle",
                     "line": {
-                        "width": 1.5 if bool(style.get("marker_outline", True)) else 0,
+                        "width": 1.5 if map_style.marker_outline else 0,
                         "color": "#FFFFFF",
                     },
                 },
                 text=labels,
-                textposition="top center",
-                textfont={"size": int(style.get("label_text_size", 11)), "color": "#111827"},
+                textposition=map_style.well_label_position,
+                textfont={"size": map_style.well_label_font_size, "color": "#111827"},
                 hovertext=_build_hover_text(
                     included_observations,
                     x_col,
@@ -367,14 +376,14 @@ def build_map_figure(
             )
         )
 
-    if bool(style.get("show_excluded", True)) and not excluded_observations.empty:
+    if map_style.show_excluded and not excluded_observations.empty:
         figure.add_trace(
             go.Scatter(
                 x=pd.to_numeric(excluded_observations[x_col], errors="coerce"),
                 y=pd.to_numeric(excluded_observations[y_col], errors="coerce"),
                 mode="markers",
                 marker={
-                    "size": max(int(style.get("marker_size", 9)), 10),
+                    "size": max(map_style.marker_size, 10),
                     "color": "#6B7280",
                     "opacity": 0.8,
                     "symbol": "x",
@@ -400,13 +409,26 @@ def build_map_figure(
         )
 
     figure.update_layout(
-        title=title or f"{property_col} Map",
+        title={"text": title or f"{property_col} Map", "font": {"size": map_style.title_font_size}},
         template="plotly_white",
-        height=int(style.get("height", 720)),
+        height=map_style.height,
         margin={"l": 30, "r": 30, "t": 70, "b": 30},
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "left", "x": 0},
         hovermode="closest",
+        font={"size": map_style.axis_font_size},
     )
-    figure.update_xaxes(title_text=x_axis_title, zeroline=False)
-    figure.update_yaxes(title_text=y_axis_title, zeroline=False, scaleanchor="x", scaleratio=1)
+    figure.update_xaxes(
+        title_text=x_axis_title,
+        title_font={"size": map_style.axis_font_size},
+        tickfont={"size": map_style.axis_font_size},
+        zeroline=False,
+    )
+    figure.update_yaxes(
+        title_text=y_axis_title,
+        title_font={"size": map_style.axis_font_size},
+        tickfont={"size": map_style.axis_font_size},
+        zeroline=False,
+        scaleanchor="x",
+        scaleratio=1,
+    )
     return figure

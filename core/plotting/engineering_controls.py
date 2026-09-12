@@ -50,6 +50,7 @@ def add_engineering_control_traces(
     unit: str | None = "",
     show_manual: bool = True,
     show_region_points: bool = False,
+    marker_size: int = 13,
 ) -> None:
     if controls is None or controls.empty:
         return
@@ -75,7 +76,7 @@ def add_engineering_control_traces(
                 y=pd.to_numeric(frame[y_col], errors="coerce"),
                 mode="markers",
                 marker={
-                    "size": 13,
+                    "size": int(marker_size),
                     "color": color,
                     "symbol": symbol,
                     "line": {"width": 2, "color": "#111827"},
