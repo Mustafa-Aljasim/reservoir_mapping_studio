@@ -102,6 +102,7 @@ except ImportError:
         if hidden_names:
             export_figure.data = tuple(trace for trace in export_figure.data if trace.name not in hidden_names)
         return export_figure
+from core.plotting.map_style import LABEL_DENSITY_OPTIONS, LABEL_POSITION_OPTIONS, WELL_LABEL_CONTENT_OPTIONS
 from core.plotting.styling import format_numeric
 from core.scenarios import (
     create_map_scenario,
@@ -1140,39 +1141,154 @@ def render_style_controls(filtered_with_include: pd.DataFrame, property_col: str
         )
     cols = st.columns(2)
     with cols[0]:
-        style["show_contour_lines"] = st.checkbox("Show Contour Lines", value=bool(style.get("show_contour_lines", True)))
+        style["show_contour_lines"] = st.checkbox("Contour Lines", value=bool(style.get("show_contour_lines", True)))
         style["show_wells"] = st.checkbox("Show Wells", value=bool(style.get("show_wells", True)))
         style["marker_outline"] = st.checkbox("Marker Outline", value=bool(style.get("marker_outline", True)))
     with cols[1]:
         style["show_contour_labels"] = st.checkbox(
-            "Show Contour Labels",
+            "Contour Labels",
             value=bool(style.get("show_contour_labels", False)) and bool(style.get("show_contour_lines", True)),
             disabled=not bool(style.get("show_contour_lines", True)),
         )
+        if not bool(style.get("show_contour_lines", True)):
+            style["show_contour_labels"] = False
         style["show_excluded"] = st.checkbox("Show Excluded Observations", value=bool(style.get("show_excluded", True)))
 
-    style["contour_line_width"] = st.slider(
-        "Contour Width",
-        min_value=0.0,
-        max_value=3.0,
-        value=float(style.get("contour_line_width", 0.75)),
-        step=0.25,
+    contour_cols = st.columns(2)
+    with contour_cols[0]:
+        style["contour_line_width"] = st.slider(
+            "Contour Width",
+            min_value=0.0,
+            max_value=3.0,
+            value=float(style.get("contour_line_width", 0.75)),
+            step=0.25,
+        )
+    with contour_cols[1]:
+        style["contour_label_font_size"] = st.slider(
+            "Contour Label Font Size",
+            min_value=6,
+            max_value=24,
+            value=int(style.get("contour_label_font_size", 10)),
+            disabled=not bool(style.get("show_contour_labels", False)),
+        )
+
+    marker_cols = st.columns(2)
+    with marker_cols[0]:
+        style["marker_size"] = st.slider("Well Marker Size", min_value=4, max_value=20, value=int(style.get("marker_size", 9)))
+    with marker_cols[1]:
+        style["marker_opacity"] = st.slider(
+            "Well Marker Opacity",
+            min_value=0.1,
+            max_value=1.0,
+            value=float(style.get("marker_opacity", 0.9)),
+        )
+    style["engineering_control_marker_size"] = st.slider(
+        "Engineering Control Marker Size",
+        min_value=4,
+        max_value=30,
+        value=int(style.get("engineering_control_marker_size", 13)),
     )
-    style["marker_size"] = st.slider("Marker Size", min_value=4, max_value=20, value=int(style.get("marker_size", 9)))
-    style["marker_opacity"] = st.slider(
-        "Marker Opacity",
-        min_value=0.1,
-        max_value=1.0,
-        value=float(style.get("marker_opacity", 0.9)),
+
+    st.markdown("##### Well Labels")
+    legacy_label_mode = str(style.get("well_label_mode", "None"))
+    default_show_labels = bool(style.get("show_well_labels", legacy_label_mode != "None"))
+    style["show_well_labels"] = st.checkbox("Show Well Labels", value=default_show_labels)
+    content_options = list(WELL_LABEL_CONTENT_OPTIONS)
+    if not well_col:
+        content_options = ["Property Value"]
+    current_label = legacy_label_mode.replace("Well Name + Property Value", "Well Name + Value")
+    if current_label in {"None", "Off"}:
+        current_label = "Property Value" if not well_col else "Well Name"
+    if current_label not in content_options:
+        current_label = content_options[0]
+    label_cols = st.columns(2)
+    with label_cols[0]:
+        style["well_label_mode"] = st.radio(
+            "Well Label Content",
+            content_options,
+            index=content_options.index(current_label),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    with label_cols[1]:
+        density_options = list(LABEL_DENSITY_OPTIONS)
+        current_density = str(style.get("label_density", "All"))
+        if current_density not in density_options:
+            current_density = "All"
+        style["label_density"] = st.radio(
+            "Label Density",
+            density_options,
+            index=density_options.index(current_density),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    if style.get("label_density") == "None":
+        style["show_well_labels"] = False
+    label_style_cols = st.columns(4)
+    with label_style_cols[0]:
+        style["well_label_font_size"] = st.slider(
+            "Well Label Font Size",
+            min_value=6,
+            max_value=24,
+            value=int(style.get("well_label_font_size", style.get("label_text_size", 10))),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    with label_style_cols[1]:
+        current_position = str(style.get("well_label_position", "top center"))
+        position_options = list(LABEL_POSITION_OPTIONS)
+        if current_position not in position_options:
+            current_position = "top center"
+        style["well_label_position"] = st.selectbox(
+            "Label Position",
+            position_options,
+            index=position_options.index(current_position),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    with label_style_cols[2]:
+        try:
+            current_label_decimals = int(style.get("label_decimal_places", 0))
+        except (TypeError, ValueError):
+            current_label_decimals = 0
+        if current_label_decimals not in [0, 1, 2]:
+            current_label_decimals = 0
+        style["label_decimal_places"] = st.selectbox(
+            "Label Decimal Places",
+            [0, 1, 2],
+            index=[0, 1, 2].index(current_label_decimals),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    with label_style_cols[3]:
+        style["label_include_unit"] = st.checkbox(
+            "Include Unit in Point Label",
+            value=bool(style.get("label_include_unit", False)),
+            disabled=not bool(style.get("show_well_labels", False)),
+        )
+    separation_mode_options = ["Auto", "Manual"]
+    current_separation_mode = str(style.get("label_min_separation_mode", "Auto"))
+    if current_separation_mode not in separation_mode_options:
+        current_separation_mode = "Auto"
+    style["label_min_separation_mode"] = st.radio(
+        "Minimum Label Separation",
+        separation_mode_options,
+        index=separation_mode_options.index(current_separation_mode),
+        horizontal=True,
+        disabled=not bool(style.get("show_well_labels", False)) or style.get("label_density") != "Smart / Declutter",
     )
-    label_options = ["None", "Property Value"]
-    if well_col:
-        label_options = ["None", "Well Name", "Property Value", "Well Name + Property Value"]
-    current_label = style.get("well_label_mode", "None")
-    if current_label not in label_options:
-        current_label = "None"
-    style["well_label_mode"] = st.selectbox("Well Labels", label_options, index=label_options.index(current_label))
-    style["label_text_size"] = st.slider("Label Text Size", min_value=8, max_value=18, value=int(style.get("label_text_size", 11)))
+    if style["label_min_separation_mode"] == "Manual":
+        style["label_min_separation"] = st.slider(
+            "Manual Separation",
+            min_value=0.01,
+            max_value=0.20,
+            value=float(style.get("label_min_separation", 0.06)),
+            step=0.01,
+            disabled=not bool(style.get("show_well_labels", False)) or style.get("label_density") != "Smart / Declutter",
+        )
+
+    font_cols = st.columns(3)
+    with font_cols[0]:
+        style["title_font_size"] = st.slider("Title Font Size", min_value=8, max_value=36, value=int(style.get("title_font_size", 16)))
+    with font_cols[1]:
+        style["axis_font_size"] = st.slider("Axis Font Size", min_value=6, max_value=28, value=int(style.get("axis_font_size", 12)))
+    with font_cols[2]:
+        style["colorbar_font_size"] = st.slider("Colorbar Font Size", min_value=6, max_value=28, value=int(style.get("colorbar_font_size", 11)))
     style["title_override"] = st.text_input("Map Title Override", value=style.get("title_override", ""))
     st.session_state.style_settings = style
     return style
@@ -2591,12 +2707,13 @@ with map_col:
             unit=display_unit,
             show_manual=bool(context_layer_settings.get("show_engineering_controls", True)),
             show_region_points=bool(context_layer_settings.get("show_region_control_points", False)),
+            marker_size=int(context_plot_style.get("engineering_control_marker_size", 13)),
         )
         move_observation_traces_to_top(figure)
         preview_point = st.session_state.get("control_point_preview")
         if preview_point:
             figure.add_trace(go.Scatter(x=[preview_point["x"]], y=[preview_point["y"]], mode="markers",
-                name="Control location preview", marker={"symbol": "diamond", "size": 15, "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
+                name="Control location preview", marker={"symbol": "diamond", "size": int(context_plot_style.get("engineering_control_marker_size", 13)), "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
         current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
         if is_pressure_map and pressure_reference_date:
@@ -2779,12 +2896,13 @@ with map_col:
             unit=active_display_unit,
             show_manual=bool(layer_settings.get("show_engineering_controls", True)),
             show_region_points=bool(layer_settings.get("show_region_control_points", False)),
+            marker_size=int(plot_style.get("engineering_control_marker_size", 13)),
         )
         move_observation_traces_to_top(figure)
         preview_point = st.session_state.get("control_point_preview")
         if preview_point:
             figure.add_trace(go.Scatter(x=[preview_point["x"]], y=[preview_point["y"]], mode="markers",
-                name="Control location preview", marker={"symbol": "diamond", "size": 15, "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
+                name="Control location preview", marker={"symbol": "diamond", "size": int(plot_style.get("engineering_control_marker_size", 13)), "color": "#fef08a", "line": {"width": 2, "color": "#111827"}}))
         current_plot_figure = figure
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False, "scrollZoom": True})
 

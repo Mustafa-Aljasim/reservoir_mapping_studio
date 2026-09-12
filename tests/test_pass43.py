@@ -8,6 +8,7 @@ from core.geostatistics.kriging import universal_kriging_interpolate
 from core.interpolation import interpolate_surface_result
 from core.plotting.map_builder import build_map_figure, map_figure_for_static_export
 from core.scenarios import create_map_scenario, safe_scenario_to_generated_map, scenario_display_label
+from utils.export import figure_to_image_bytes
 
 
 def _grid(n: int = 5):
@@ -69,6 +70,28 @@ def test_scenario_snapshot_switching_uses_ids_and_never_recomputes(monkeypatch):
             assert scenario_display_label(scenario)
 
 
+def test_saved_scenario_preserves_label_style_snapshot():
+    scenario = create_map_scenario(
+        "Pressure 2025",
+        _generated_map("A", 3000.0, "IDW"),
+        project_context={
+            "style_settings": {
+                "show_well_labels": True,
+                "well_label_mode": "Property Value",
+                "well_label_font_size": 9,
+                "label_density": "Smart / Declutter",
+            }
+        },
+    )
+
+    generated, errors = safe_scenario_to_generated_map(scenario)
+
+    assert not errors
+    assert generated is not None
+    assert generated["display_style_settings"]["well_label_font_size"] == 9
+    assert generated["display_style_settings"]["label_density"] == "Smart / Declutter"
+
+
 def test_contour_lines_off_preserves_filled_surface_and_hides_labels():
     grid_x, grid_y = _grid(4)
     observations = pd.DataFrame({"X": [0.0, 1.0, 0.0], "Y": [0.0, 0.0, 1.0], "Pressure": [10.0, 20.0, 30.0]})
@@ -103,6 +126,152 @@ def test_contour_lines_off_preserves_filled_surface_and_hides_labels():
     assert with_lines.data[0].contours.showlines is True
     assert with_lines.data[0].contours.showlabels is True
     assert with_lines.data[0].line.width == 1.25
+
+
+def test_map_style_drives_interactive_and_export_label_configuration():
+    grid_x, grid_y = _grid(4)
+    observations = pd.DataFrame(
+        {
+            "X": [0.0, 1.0, 0.0],
+            "Y": [0.0, 0.0, 1.0],
+            "Pressure": [3074.8, 3020.4, 3010.2],
+            "Well": ["RMS-001", "RMS-002", "RMS-003"],
+        }
+    )
+    style = {
+        "show_surface": True,
+        "show_wells": True,
+        "show_well_labels": True,
+        "well_label_mode": "Property Value",
+        "well_label_font_size": 8,
+        "label_decimal_places": 0,
+        "marker_size": 5,
+        "show_contour_lines": True,
+        "show_contour_labels": False,
+        "contour_label_font_size": 7,
+    }
+
+    figure = build_map_figure(
+        grid_x,
+        grid_y,
+        grid_x + grid_y,
+        observations,
+        observations.iloc[0:0].copy(),
+        "X",
+        "Y",
+        "Pressure",
+        well_col="Well",
+        unit="psi",
+        style=style,
+    )
+    export_figure = map_figure_for_static_export(figure)
+
+    raw_trace = next(trace for trace in export_figure.data if trace.name == "Raw measured points")
+    assert raw_trace.marker.size == 5
+    assert raw_trace.textfont.size == 8
+    assert list(raw_trace.text) == ["3075", "3020", "3010"]
+    assert export_figure.data[0].contours.showlabels is False
+
+
+def test_static_export_scale_does_not_mutate_logical_label_size(monkeypatch):
+    grid_x, grid_y = _grid(3)
+    observations = pd.DataFrame({"X": [0.0, 1.0], "Y": [0.0, 1.0], "Pressure": [10.0, 20.0]})
+    figure = build_map_figure(
+        grid_x,
+        grid_y,
+        grid_x + grid_y,
+        observations,
+        observations.iloc[0:0].copy(),
+        "X",
+        "Y",
+        "Pressure",
+        style={"show_well_labels": True, "well_label_font_size": 8, "well_label_mode": "Property Value"},
+    )
+    captured = {}
+
+    def fake_to_image(figure_arg, *, format, width, height, scale):
+        captured.update({"format": format, "width": width, "height": height, "scale": scale})
+        raw_trace = next(trace for trace in figure_arg.data if trace.name == "Raw measured points")
+        assert raw_trace.textfont.size == 8
+        return b"image"
+
+    monkeypatch.setattr("plotly.io.to_image", fake_to_image)
+    assert figure_to_image_bytes(figure, "png", width=1600, height=1000, scale=3) == b"image"
+    assert captured == {"format": "png", "width": 1600, "height": 1000, "scale": 3.0}
+
+
+def test_well_labels_off_keeps_markers_and_hover_without_visible_text():
+    grid_x, grid_y = _grid(3)
+    observations = pd.DataFrame(
+        {"X": [0.0, 1.0], "Y": [0.0, 1.0], "Pressure": [10.0, 20.0], "Well": ["A", "B"]}
+    )
+    figure = build_map_figure(
+        grid_x,
+        grid_y,
+        grid_x + grid_y,
+        observations,
+        observations.iloc[0:0].copy(),
+        "X",
+        "Y",
+        "Pressure",
+        well_col="Well",
+        hover_columns=[("Panel", "Panel")],
+        style={"show_wells": True, "show_well_labels": False, "well_label_mode": "Well Name"},
+    )
+
+    raw_trace = next(trace for trace in figure.data if trace.name == "Raw measured points")
+    assert raw_trace.mode == "markers"
+    assert raw_trace.text is None
+    assert len(raw_trace.x) == len(observations)
+    assert "Well: A" in raw_trace.hovertext[0]
+
+
+def test_smart_label_density_declutters_text_without_removing_markers():
+    grid_x, grid_y = _grid(4)
+    observations = pd.DataFrame(
+        {
+            "X": np.linspace(0.0, 0.1, 20),
+            "Y": np.linspace(0.0, 0.1, 20),
+            "Pressure": np.linspace(3000.0, 3020.0, 20),
+            "Well": [f"W{i:02d}" for i in range(20)],
+        }
+    )
+    all_labels = build_map_figure(
+        grid_x,
+        grid_y,
+        grid_x + grid_y,
+        observations,
+        observations.iloc[0:0].copy(),
+        "X",
+        "Y",
+        "Pressure",
+        well_col="Well",
+        style={"show_well_labels": True, "well_label_mode": "Well Name", "label_density": "All"},
+    )
+    smart_labels = build_map_figure(
+        grid_x,
+        grid_y,
+        grid_x + grid_y,
+        observations,
+        observations.iloc[0:0].copy(),
+        "X",
+        "Y",
+        "Pressure",
+        well_col="Well",
+        style={
+            "show_well_labels": True,
+            "well_label_mode": "Well Name",
+            "label_density": "Smart / Declutter",
+            "label_min_separation_mode": "Manual",
+            "label_min_separation": 0.20,
+        },
+    )
+
+    all_trace = next(trace for trace in all_labels.data if trace.name == "Raw measured points")
+    smart_trace = next(trace for trace in smart_labels.data if trace.name == "Raw measured points")
+    assert len(smart_trace.x) == len(observations)
+    assert sum(bool(text) for text in all_trace.text) == len(observations)
+    assert 0 < sum(bool(text) for text in smart_trace.text) < len(observations)
 
 
 def test_static_export_can_remove_raw_points_and_controls():
